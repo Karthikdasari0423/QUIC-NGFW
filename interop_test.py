@@ -594,8 +594,8 @@ async def test_conn_close_im(server:Server,configuration: QuicConfiguration):
 async def test_parallel_conn(server: Server, configuration: QuicConfiguration):
     import subprocess
     basecommand = "python3 /root/aioquic/examples/http3_client.py --ca-certs /root/aioquic/tests/pycacert.pem -v "
-
-   # myftd2 = "https://172.16.3.1:4433/"
+    myftd1 = "https://172.16.2.2:4433/"
+   # myftd2 = "https://172.16.3.1:4433/" #just for your reference
 
     def run_parallel(url, parallel=1, data="",):
         sed_insert()
@@ -623,8 +623,9 @@ async def test_parallel_conn(server: Server, configuration: QuicConfiguration):
             for i in (l1):
                 subprocess.Popen("{}".format(i), shell=True)
 
-
-   # run_parallel(myftd1, 10, data=10000)
+    
+   # run_parallel(myftd1, 10, data=10000) #just for your reference
+    run_parallel(myftd1, 10, data=10000)
     server.result |= Result.M
 
 async def test_nat_rebinding(server: Server, configuration: QuicConfiguration):
