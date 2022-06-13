@@ -949,6 +949,204 @@ async def test_handle_request_frame_push_promise_from_client(server: Server, con
     except:
         server.result |= Result.M
 
+        
+        
+        
+
+
+async def test_received_wrong_ietf_version_data(server: Server, configuration: QuicConfiguration):
+
+    from aioquic.h3.connection import H3_ALPN, H3Connection, ErrorCode, encode_frame, FrameType
+    from aioquic.quic.connection import QuicConnection, QuicReceiveContext
+    port = server.http3_port or server.port
+    if server.path is None:
+        return
+    configuration.alpn_protocols = H3_ALPN
+    async with connect(
+            server.host,
+            port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+    ) as client:
+        from aioquic.quic.packet_builder import QuicPacketBuilder
+        builder = QuicPacketBuilder(
+            host_cid=client._quic._peer_cid.cid,
+            is_client=False,
+            peer_cid=client._quic.host_cid,
+            version=0xFF001122,  # DRAFT_16
+        )
+        from aioquic.quic.crypto import CryptoPair
+        crypto = CryptoPair()
+        crypto.setup_initial(
+            client._quic._peer_cid.cid, is_client=False, version=client._quic._version
+        )
+        from aioquic.quic.packet import PACKET_TYPE_INITIAL
+        builder.start_packet(PACKET_TYPE_INITIAL, crypto)
+        from aioquic.quic.packet import QuicFrameType
+        buf = builder.start_frame(QuicFrameType.PADDING)
+        buf.push_bytes(bytes(builder.remaining_flight_space))
+
+        for datagram in builder.flush()[0]:
+            client._quic.receive_datagram(datagram, client, now=time.time())
+
+        server.result |= Result.M
+
+
+async def test_exactly_entire_packet(server: Server, configuration: QuicConfiguration):
+    from aioquic.h3.connection import H3_ALPN, H3Connection, ErrorCode, encode_frame, FrameType
+    from aioquic.quic.connection import QuicConnection, QuicReceiveContext
+    port = server.http3_port or server.port
+    if server.path is None:
+        return
+    configuration.alpn_protocols = H3_ALPN
+    async with connect(
+            server.host,
+            port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+    ) as client:
+        payload = b"Z" * 1250
+        for i in range(20):
+            client._quic.send_datagram_frame(payload)
+            print(i)
+        server.result |= Result.M
+
+
+async def test_retry_wrong_destination_cid(server: Server, configuration: QuicConfiguration):
+    from aioquic.h3.connection import H3_ALPN, H3Connection, ErrorCode, encode_frame, FrameType
+    from aioquic.quic.connection import QuicConnection, QuicReceiveContext
+    port = server.http3_port or server.port
+    if server.path is None:
+        return
+    configuration.alpn_protocols = H3_ALPN
+    async with connect(
+            server.host,
+            port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+    ) as client:
+        from aioquic.quic.packet import encode_quic_retry
+        import binascii
+        client._quic.receive_datagram(
+            encode_quic_retry(
+                version=client._quic._version,
+                source_cid=binascii.unhexlify("85abb547bf28be97"),
+                destination_cid=binascii.unhexlify("c98343fe8f5f0ff4"),
+                original_destination_cid=client._quic._peer_cid.cid,
+                retry_token=bytes(16),
+            ),
+            client,
+            now=time.time(),
+        )
+        server.result |= Result.M
+
+
+async def test_handle_new_token_frame_from_client(server: Server, configuration: QuicConfiguration):
+    from aioquic.h3.connection import H3_ALPN, H3Connection, ErrorCode, encode_frame, FrameType
+    from aioquic.quic.connection import QuicConnection, QuicReceiveContext
+    port = server.http3_port or server.port
+    if server.path is None:
+        return
+    configuration.alpn_protocols = H3_ALPN
+    async with connect(
+            server.host,
+            port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+    ) as client:
+        from aioquic import tls
+        def client_receive_context(client, epoch=tls.Epoch.ONE_RTT):
+            return QuicReceiveContext(
+                epoch=epoch,
+                host_cid=client._quic.host_cid,
+                network_path=client._quic._network_paths[0],
+                quic_logger_frames=[],
+                time=time.time(),
+
+            )
+
+        from aioquic.quic.packet import QuicFrameType
+        from aioquic._buffer import Buffer
+        import binascii
+        client._quic._handle_new_token_frame(
+            client_receive_context(client),
+            QuicFrameType.NEW_TOKEN,
+            Buffer(data=binascii.unhexlify("080102030405060708")),
+        )
+        server.result |= Result.M
+
+
+
+
+async def test_pings_parallel(server: Server, configuration: QuicConfiguration):
+
+    from aioquic.h3.connection import H3_ALPN
+    port = server.http3_port or server.port
+    if server.path is None:
+        return
+    configuration.alpn_protocols = H3_ALPN
+    async with connect(
+            server.host,
+            port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+    ) as client:
+        coros = [client.ping() for x in range(16)]
+        await asyncio.gather(*coros)
+        server.result |= Result.M
+
+
+
+async def test_fin_without_data(server: Server, configuration: QuicConfiguration):
+
+    from aioquic.h3.connection import H3_ALPN
+    port = server.http3_port or server.port
+    if server.path is None:
+        return
+    configuration.alpn_protocols = H3_ALPN
+    async with connect(
+            server.host,
+            port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+    ) as client:
+        from aioquic.quic.stream import QuicStream
+        from aioquic.quic.events import StreamDataReceived
+        from aioquic.quic.packet import QuicStreamFrame
+        stream = QuicStream(stream_id=0)
+        stream.receiver.handle_frame(QuicStreamFrame(offset=0, data=b"", fin=True)),
+        StreamDataReceived(data=b"", end_stream=True, stream_id=0)
+
+        server.result |= Result.M
+
+
+
+async def test_reset_after_fin(server: Server, configuration: QuicConfiguration):
+
+    from aioquic.h3.connection import H3_ALPN
+    port = server.http3_port or server.port
+    if server.path is None:
+        return
+    configuration.alpn_protocols = H3_ALPN
+    async with connect(
+            server.host,
+            port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+    ) as client:
+        from aioquic.quic.stream import QuicStream
+        from aioquic.quic.packet import QuicStreamFrame
+        stream = QuicStream(stream_id=0)
+        stream.receiver.handle_frame(QuicStreamFrame(offset=0, data=b"arun", fin=True))
+        stream.receiver.handle_reset(final_size=4),
+        from aioquic.quic.events import StreamReset
+        from aioquic.quic.packet import QuicErrorCode
+        StreamReset(error_code=QuicErrorCode.NO_ERROR, stream_id=0)
+        # client._quic.reset_stream(stream_id=0,error_code=QuicErrorCode.NO_ERROR)
+        server.result |= Result.M
+
+
+        
 
 async def test_nat_rebinding(server: Server, configuration: QuicConfiguration):
     async with connect(
