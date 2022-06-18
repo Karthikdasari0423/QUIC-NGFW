@@ -93,7 +93,6 @@ SERVERS = [
     ),
     Server("gquic", "quic.rocks", retry_port=None),
     Server("lsquic", "http3-test.litespeedtech.com", push_path="/200?push=/100"),
-    Server("kdaquic", "172.16.2.2", port=4433, verify_mode=ssl.CERT_NONE),
     Server(
         "msquic",
         "quic.westus.cloudapp.azure.com",
@@ -895,31 +894,41 @@ async def test_receive_malformed_frame(server: Server, configuration: QuicConfig
         print(e)
         server.result |= Result.M
 
-async def test_push_promise_client(server: Server, configuration: QuicConfiguration):
-    from aioquic.quic.connection import QuicConnection, QuicReceiveContext
-    port = server.http3_port or server.port
-    if server.path is None:
-        return
-    configuration.alpn_protocols = H3_ALPN
-    async with connect(
-            server.host,
-            port,
-            configuration=configuration,
-            create_protocol=HttpClient,
-    ) as client:
-        client = cast(HttpClient, client)
-        from aioquic.h3.connection import encode_frame, FrameType
-        from aioquic.quic.events import StreamDataReceived
-        sid=client._quic.get_next_available_stream_id()
-        client._http.handle_event(
-            StreamDataReceived(
-                stream_id=int(sid),
-                data=encode_frame(FrameType.PUSH_PROMISE, b"hello"),
-                end_stream=False,
-            )
-        )
 
-    server.result |= Result.M
+async def test_push_promise_client(server: Server, configuration: QuicConfiguration):
+    try:
+
+        from aioquic.quic.connection import QuicConnection, QuicReceiveContext
+        port = server.http3_port or server.port
+        if server.path is None:
+            return
+        configuration.alpn_protocols = H3_ALPN
+        async with connect(
+                server.host,
+                port,
+                configuration=configuration,
+                create_protocol=HttpClient,
+        ) as client:
+
+            # request_headers = [(b":method", b"GET"),(b":scheme", b"https"),]
+            request_headerss = [(b"hello"),(b"hai"), ]
+            client = cast(HttpClient, client)
+            from aioquic.h3.connection import encode_frame, FrameType
+            from aioquic.quic.events import StreamDataReceived
+            #sid=client._quic.get_next_available_stream_id()
+            client._http.handle_event(
+                StreamDataReceived(
+                    stream_id=0,
+                    data=encode_frame(FrameType.PUSH_PROMISE, b"hello"),
+                    end_stream=False,
+                )
+            )
+            client._http.send_push_promise(stream_id=0,headers=request_headerss)
+        server.result |= Result.H
+
+    except Exception as e:
+        print(e)
+        server.result |= Result.M
 
 
 
@@ -938,7 +947,7 @@ async def test_handle_request_frame_push_promise_from_client(server: Server, con
                 configuration=configuration,
                 create_protocol=HttpClient,
         ) as client:
-
+	    request_headers = [(b""),(b""),(b""), ]
             from aioquic.quic.events import StreamDataReceived
             client._http.handle_event(
                     StreamDataReceived(
@@ -947,6 +956,7 @@ async def test_handle_request_frame_push_promise_from_client(server: Server, con
                         end_stream=False,
                     )
             )
+	    client._http.send_push_promise(stream_id=0,headers=request_headers)
 
         server.result |= Result.H
 
