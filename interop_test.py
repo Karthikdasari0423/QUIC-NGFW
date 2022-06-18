@@ -947,7 +947,7 @@ async def test_handle_request_frame_push_promise_from_client(server: Server, con
                 configuration=configuration,
                 create_protocol=HttpClient,
         ) as client:
-	    request_headers = [(b""),(b""),(b""), ]
+            request_headers = [(b""),(b""),(b""), ]
             from aioquic.quic.events import StreamDataReceived
             client._http.handle_event(
                     StreamDataReceived(
@@ -956,8 +956,7 @@ async def test_handle_request_frame_push_promise_from_client(server: Server, con
                         end_stream=False,
                     )
             )
-	    client._http.send_push_promise(stream_id=0,headers=request_headers)
-
+            client._http.send_push_promise(stream_id=0,headers=request_headers)
         server.result |= Result.H
 
     except Exception as e :
