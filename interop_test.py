@@ -93,6 +93,7 @@ SERVERS = [
     ),
     Server("gquic", "quic.rocks", retry_port=None),
     Server("lsquic", "http3-test.litespeedtech.com", push_path="/200?push=/100"),
+    Server("kdaquic", "172.16.2.1", port=4433, verify_mode=ssl.CERT_NONE),
     Server(
         "msquic",
         "quic.westus.cloudapp.azure.com",
