@@ -93,7 +93,6 @@ SERVERS = [
     ),
     Server("gquic", "quic.rocks", retry_port=None),
     Server("lsquic", "http3-test.litespeedtech.com", push_path="/200?push=/100"),
-    Server("kdaquic", "172.16.2.1", port=4433, verify_mode=ssl.CERT_NONE),
     Server(
         "msquic",
         "quic.westus.cloudapp.azure.com",
@@ -623,7 +622,8 @@ async def test_parallel_conn(server: Server, configuration: QuicConfiguration):
             l1=[s1,s2,s3,s4]
             for i in (l1):
                 subprocess.Popen("{}".format(i), shell=True)
-            p1 = subprocess.run("{}".format(wc), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,universal_newlines=True)
+            wcn="grep -irn '/root/aioquic/examples/http3_client.py' -e 'parallel: int,' | wc -l"
+            p1 = subprocess.run("{}".format(wcn), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,universal_newlines=True)
 
    # run_parallel(myftd1, 10, data=10000)
    # server.result |= Result.M
