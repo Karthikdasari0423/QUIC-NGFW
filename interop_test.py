@@ -622,7 +622,7 @@ async def test_parallel_conn(server: Server, configuration: QuicConfiguration):
             s4="sed -i '558i \ \ \ \ \ \ \ \ \ \ \ \ parallel=args.parallel,' /root/aioquic/examples/http3_client.py"
             l1=[s1,s2,s3,s4]
             for i in (l1):
-                subprocess.Popen("{}".format(i), shell=True)
+                subprocess.run("{}".format(i), shell=True)
             wcn="grep -irn '/root/aioquic/examples/http3_client.py' -e 'parallel: int,' | wc -l"
             p1 = subprocess.run("{}".format(wcn), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,universal_newlines=True)
 
