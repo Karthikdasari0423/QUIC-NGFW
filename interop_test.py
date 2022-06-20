@@ -93,7 +93,6 @@ SERVERS = [
     ),
     Server("gquic", "quic.rocks", retry_port=None),
     Server("lsquic", "http3-test.litespeedtech.com", push_path="/200?push=/100"),
-    Server("kdaquic", "172.16.2.1", port=4433, verify_mode=ssl.CERT_NONE),
     Server(
         "msquic",
         "quic.westus.cloudapp.azure.com",
@@ -615,7 +614,7 @@ async def test_parallel_conn(server: Server, configuration: QuicConfiguration):
     def sed_insert():
         wc = "grep -irn '/root/aioquic/examples/http3_client.py' -e 'parallel=args.parallel,' | wc -l"
         p1 = subprocess.run("{}".format(wc), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,universal_newlines=True)
-        if (int(p1.stdout) == 0):
+        while (int(p1.stdout) == 0):
             s1="sed -i '354i \ \ \ \ parallel: int,' /root/aioquic/examples/http3_client.py"
             s2="sed -i '423i \ \ \ \ \ \ \ \ \ \ \ \ \ \ \  for i in range(parallel)' /root/aioquic/examples/http3_client.py"
             s3='''sed -i '509i \ \ \ \ parser.add_argument("--parallel", type=int, default=1, help="perform this many requests in parallel")' /root/aioquic/examples/http3_client.py'''
@@ -623,7 +622,7 @@ async def test_parallel_conn(server: Server, configuration: QuicConfiguration):
             l1=[s1,s2,s3,s4]
             for i in (l1):
                 subprocess.Popen("{}".format(i), shell=True)
-
+            p1 = subprocess.run("{}".format(wc), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,universal_newlines=True)
 
    # run_parallel(myftd1, 10, data=10000)
    # server.result |= Result.M
