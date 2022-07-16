@@ -38,7 +38,7 @@ Move interop_test.py to aioquic/examples folder
 (mv interop_test.py aioquic/examples)
 Start running server
 Make changes in the line 96 on interop_test.py
-96 Server("kdaquic", '172.16.2.2', port=4433, verify_mode=ssl.CERT_NONE),
+96 Server("kdaquic", '172.16.2.2', port=4433, retry_port=4433, verify_mode=ssl.CERT_NONE),
 here "kdaquic" is my server name and "172.16.2.2" is my ip on which server started running
 
 Run which ever testcase you want with 
@@ -53,6 +53,9 @@ here kdaquic is my server name
 Note:-
 You can use interop_test.py as a script with out even replacing /usr/local/lib/python3.8/dist-packages/aioquic/quic/connection.py with connection_cid.py but note that connection id cases will not work
 
+Note:-
+To run the "test_retry" interop testcase,you need to provide "--retry" command line argument on machine where your "http3_server.py" is running.
+(--retry demo:app)
 
 
 
