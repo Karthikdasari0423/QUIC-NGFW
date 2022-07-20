@@ -1304,7 +1304,70 @@ async def test_handle_new_token_frame_sbc(SERVER: Server, configuration: QuicCon
 
 
 
+            
+            
+            
 
+async def test_connection_migration(server: Server, configuration: QuicConfiguration):
+    async with connect(
+        server.host, server.port, configuration=configuration
+    ) as protocol:
+        # cause some traffic
+        await protocol.ping()
+        iflo=0
+        list1 = ["::", 4478]
+        import re
+        ip = "::ffff:"
+        nn = server.host
+        nm = re.split(r'(\.)', nn)
+        if int(nn[-3]) == 2:
+            nm[-3] = '3'
+            iflo +=1
+        if int(nn[-3]) == 3:
+            nm[-3] = '2'
+            iflo +=1
+        if int(nn[-1]) == 2:
+            nm[-1] = '1'
+            iflo +=1
+        if int(nn[-1]) == 1:
+            nm[-1] = '2'
+            iflo +=1
+        nm = "".join(nm)
+        if int(iflo) >=2:
+            nm = ip + nm
+            list1[0] = nm
+            addr = tuple(list1)
+        else:
+            addr = tuple(list1)
+
+        # replace transport
+        protocol._transport.close()
+        loop = asyncio.get_event_loop()
+        await loop.create_datagram_endpoint(lambda: protocol, local_addr=addr)
+
+        # cause more traffic
+        await protocol.ping()
+
+        # check log
+        path_challenges = 0
+        for event in configuration.quic_logger.to_dict()["traces"][0]["events"]:
+            if (
+                event["name"] == "transport:packet_received"
+                and event["data"]["header"]["packet_type"] == "1RTT"
+            ):
+                for frame in event["data"]["frames"]:
+                    if frame["frame_type"] == "path_challenge":
+                        path_challenges += 1
+        if not path_challenges:
+            protocol._quic._logger.warning("No PATH_CHALLENGE received")
+            server.result |= Result.H
+        else:
+            server.result |= Result.M
+
+
+            
+            
+            
 async def test_nat_rebinding(server: Server, configuration: QuicConfiguration):
     async with connect(
         server.host, server.port, configuration=configuration
