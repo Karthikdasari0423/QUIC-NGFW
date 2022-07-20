@@ -172,144 +172,6 @@ async def test_retry(server: Server, configuration: QuicConfiguration):
             ):
                 server.result |= Result.M
 
-
-
-async def test_handle_new_token_frame_sbc(SERVER: Server, configuration: QuicConfiguration):
-    try:
-        async with connect(
-                SERVER.host,SERVER.port, configuration=configuration
-        ) as protocol:
-            from aioquic.quic.connection import QuicConnection
-            import contextlib
-            from aioquic.quic.connection import QuicReceiveContext, QuicConnectionError
-            import os
-            os.system("cp /root/aioquic/tests/pycacert.pem /root/aioquic/examples/pycacert.pem")
-            SERVER_CACERTFILE = os.path.join(os.path.dirname(__file__), "pycacert.pem")
-
-            os.system("cp /root/aioquic/tests/ssl_cert.pem /root/aioquic/examples/ssl_cert.pem")
-            os.system("cp /root/aioquic/tests/ssl_key.pem /root/aioquic/examples/ssl_key.pem")
-            SERVER_CERTFILE = os.path.join(os.path.dirname(__file__), "ssl_cert.pem")
-            SERVER_KEYFILE = os.path.join(os.path.dirname(__file__), "ssl_key.pem")
-
-            import re
-            CLIENT_ADDR = [1234]
-            nn=SERVER.host
-            nm = re.split(r'(\.)', nn)
-            if int(nn[-1]) == 2:
-                nm[-1] = '1'
-            if int(nn[-1]) == 1:
-                nm[-1] = '2'
-            nm = "".join(nm)
-            CLIENT_ADDR.insert(0, nm)
-            SERVER_ADDR = []
-            SERVER_ADDR.append(SERVER.host)
-            SERVER_ADDR.append(SERVER.port)
-
-            def transfer(sender, receiver):
-                """
-                Send datagrams from `sender` to `receiver`.
-                """
-                datagrams = 0
-                from_addr = CLIENT_ADDR if sender._is_client else SERVER_ADDR
-                for data, addr in sender.datagrams_to_send(now=time.time()):
-                    datagrams += 1
-                    receiver.receive_datagram(data, from_addr, now=time.time())
-                return datagrams
-
-            def roundtrip(sender, receiver):
-                """
-                Send datagrams from `sender` to `receiver` and back.
-                """
-                return (transfer(sender, receiver), transfer(receiver, sender))
-
-            def disable_packet_pacing(connection):
-                from aioquic.quic.recovery import QuicPacketPacer
-                class DummyPacketPacer(QuicPacketPacer):
-                    def next_send_time(self, now):
-                        return None
-
-                connection._loss._pacer = DummyPacketPacer()
-
-            @contextlib.contextmanager
-            def client_and_server(
-                    client_kwargs={},
-                    client_options={},
-                    client_patch=lambda x: None,
-                    handshake=True,
-                    server_kwargs={},
-                    server_certfile=SERVER_CERTFILE,
-                    server_keyfile=SERVER_KEYFILE,
-                    server_options={},
-                    server_patch=lambda x: None,
-            ):
-                client_configuration = QuicConfiguration(
-                    is_client=True, quic_logger=QuicLogger(), **client_options
-                )
-                client_configuration.load_verify_locations(cafile=SERVER_CACERTFILE)
-
-                client = QuicConnection(configuration=client_configuration, **client_kwargs)
-                client._ack_delay = 0
-
-                disable_packet_pacing(client)
-                client_patch(client)
-                server_configuration = QuicConfiguration(
-                    is_client=False, quic_logger=QuicLogger(), **server_options
-                )
-                server_configuration.load_cert_chain(server_certfile, server_keyfile)
-
-                server = QuicConnection(
-                    configuration=server_configuration,
-                    original_destination_connection_id=client.original_destination_connection_id,
-                    **server_kwargs
-                )
-                server._ack_delay = 0
-                disable_packet_pacing(server)
-                server_patch(server)
-
-                # perform handshake
-                if handshake:
-                    client.connect(SERVER_ADDR, now=time.time())
-                    for i in range(3):
-                        # from tests.test_connection import roundtrip
-                        roundtrip(client, server)
-
-                yield client, server
-
-                # close
-                client.close()
-                server.close()
-
-            from aioquic import tls
-            def client_receive_context(client, epoch=tls.Epoch.ONE_RTT):
-                return QuicReceiveContext(
-                    epoch=epoch,
-                    host_cid=client.host_cid,
-                    network_path=client._network_paths[0],
-                    quic_logger_frames=[],
-                    time=time.time(),
-                )
-
-            from aioquic._buffer import Buffer
-
-            from aioquic import tls
-            with client_and_server() as (client, server):
-
-
-                # server receives NEW_TOKEN
-                from aioquic.quic.packet import QuicFrameType
-                import binascii
-                server._handle_new_token_frame(
-                    client_receive_context(client),
-                    QuicFrameType.NEW_TOKEN,
-                    Buffer(data=binascii.unhexlify("080102030405060708")),
-                )
-                SERVER.result |= Result.H
-    except Exception as e:
-            print(e)
-            SERVER.result |= Result.M
-
-
-
 async def test_quantum_readiness(server: Server, configuration: QuicConfiguration):
     configuration.quantum_readiness_test = True
     async with connect(
@@ -1305,7 +1167,139 @@ async def test_reset_after_fin(server: Server, configuration: QuicConfiguration)
 
 
 
+async def test_handle_new_token_frame_sbc(SERVER: Server, configuration: QuicConfiguration):
+    try:
+        async with connect(
+                SERVER.host,SERVER.port, configuration=configuration
+        ) as protocol:
+            from aioquic.quic.connection import QuicConnection
+            import contextlib
+            from aioquic.quic.connection import QuicReceiveContext, QuicConnectionError
+            import os
+            os.system("cp /root/aioquic/tests/pycacert.pem /root/aioquic/examples/pycacert.pem")
+            SERVER_CACERTFILE = os.path.join(os.path.dirname(__file__), "pycacert.pem")
 
+            os.system("cp /root/aioquic/tests/ssl_cert.pem /root/aioquic/examples/ssl_cert.pem")
+            os.system("cp /root/aioquic/tests/ssl_key.pem /root/aioquic/examples/ssl_key.pem")
+            SERVER_CERTFILE = os.path.join(os.path.dirname(__file__), "ssl_cert.pem")
+            SERVER_KEYFILE = os.path.join(os.path.dirname(__file__), "ssl_key.pem")
+
+            import re
+            CLIENT_ADDR = [1234]
+            nn=SERVER.host
+            nm = re.split(r'(\.)', nn)
+            if int(nn[-1]) == 2:
+                nm[-1] = '1'
+            if int(nn[-1]) == 1:
+                nm[-1] = '2'
+            nm = "".join(nm)
+            CLIENT_ADDR.insert(0, nm)
+            SERVER_ADDR = []
+            SERVER_ADDR.append(SERVER.host)
+            SERVER_ADDR.append(SERVER.port)
+
+            def transfer(sender, receiver):
+                """
+                Send datagrams from `sender` to `receiver`.
+                """
+                datagrams = 0
+                from_addr = CLIENT_ADDR if sender._is_client else SERVER_ADDR
+                for data, addr in sender.datagrams_to_send(now=time.time()):
+                    datagrams += 1
+                    receiver.receive_datagram(data, from_addr, now=time.time())
+                return datagrams
+
+            def roundtrip(sender, receiver):
+                """
+                Send datagrams from `sender` to `receiver` and back.
+                """
+                return (transfer(sender, receiver), transfer(receiver, sender))
+
+            def disable_packet_pacing(connection):
+                from aioquic.quic.recovery import QuicPacketPacer
+                class DummyPacketPacer(QuicPacketPacer):
+                    def next_send_time(self, now):
+                        return None
+
+                connection._loss._pacer = DummyPacketPacer()
+
+            @contextlib.contextmanager
+            def client_and_server(
+                    client_kwargs={},
+                    client_options={},
+                    client_patch=lambda x: None,
+                    handshake=True,
+                    server_kwargs={},
+                    server_certfile=SERVER_CERTFILE,
+                    server_keyfile=SERVER_KEYFILE,
+                    server_options={},
+                    server_patch=lambda x: None,
+            ):
+                client_configuration = QuicConfiguration(
+                    is_client=True, quic_logger=QuicLogger(), **client_options
+                )
+                client_configuration.load_verify_locations(cafile=SERVER_CACERTFILE)
+
+                client = QuicConnection(configuration=client_configuration, **client_kwargs)
+                client._ack_delay = 0
+
+                disable_packet_pacing(client)
+                client_patch(client)
+                server_configuration = QuicConfiguration(
+                    is_client=False, quic_logger=QuicLogger(), **server_options
+                )
+                server_configuration.load_cert_chain(server_certfile, server_keyfile)
+
+                server = QuicConnection(
+                    configuration=server_configuration,
+                    original_destination_connection_id=client.original_destination_connection_id,
+                    **server_kwargs
+                )
+                server._ack_delay = 0
+                disable_packet_pacing(server)
+                server_patch(server)
+
+                # perform handshake
+                if handshake:
+                    client.connect(SERVER_ADDR, now=time.time())
+                    for i in range(3):
+                        # from tests.test_connection import roundtrip
+                        roundtrip(client, server)
+
+                yield client, server
+
+                # close
+                client.close()
+                server.close()
+
+            from aioquic import tls
+            def client_receive_context(client, epoch=tls.Epoch.ONE_RTT):
+                return QuicReceiveContext(
+                    epoch=epoch,
+                    host_cid=client.host_cid,
+                    network_path=client._network_paths[0],
+                    quic_logger_frames=[],
+                    time=time.time(),
+                )
+
+            from aioquic._buffer import Buffer
+
+            from aioquic import tls
+            with client_and_server() as (client, server):
+
+
+                # server receives NEW_TOKEN
+                from aioquic.quic.packet import QuicFrameType
+                import binascii
+                server._handle_new_token_frame(
+                    client_receive_context(client),
+                    QuicFrameType.NEW_TOKEN,
+                    Buffer(data=binascii.unhexlify("080102030405060708")),
+                )
+                SERVER.result |= Result.H
+    except Exception as e:
+            print(e)
+            SERVER.result |= Result.M
 
 
 
