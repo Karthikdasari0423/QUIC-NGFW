@@ -1304,47 +1304,35 @@ async def test_handle_new_token_frame_sbc(SERVER: Server, configuration: QuicCon
 
 
 
-            
-            
-            
-
 async def test_connection_migration(server: Server, configuration: QuicConfiguration):
     async with connect(
         server.host, server.port, configuration=configuration
     ) as protocol:
-        # cause some traffic
-        await protocol.ping()
-        iflo=0
+        import netifaces as ni
+        try:
+            interface = "eth1:3"
+            ip = ni.ifaddresses(interface)[ni.AF_INET][0]['addr']
+        except Exception as e:
+            print(e)
+            ip=None
+
         list1 = ["::", 4478]
-        import re
-        ip = "::ffff:"
-        nn = server.host
-        nm = re.split(r'(\.)', nn)
-        if int(nn[-3]) == 2:
-            nm[-3] = '3'
-            iflo +=1
-        if int(nn[-3]) == 3:
-            nm[-3] = '2'
-            iflo +=1
-        if int(nn[-1]) == 2:
-            nm[-1] = '1'
-            iflo +=1
-        if int(nn[-1]) == 1:
-            nm[-1] = '2'
-            iflo +=1
-        nm = "".join(nm)
-        if int(iflo) >=2:
-            nm = ip + nm
+        ip_mac = "::ffff:"
+        if ip:
+            nm = ip_mac + str(ip)
             list1[0] = nm
             addr = tuple(list1)
         else:
             addr = tuple(list1)
 
+
+        # cause some traffic
+        await protocol.ping()
+
         # replace transport
         protocol._transport.close()
         loop = asyncio.get_event_loop()
         await loop.create_datagram_endpoint(lambda: protocol, local_addr=addr)
-
         # cause more traffic
         await protocol.ping()
 
@@ -1363,6 +1351,14 @@ async def test_connection_migration(server: Server, configuration: QuicConfigura
             server.result |= Result.H
         else:
             server.result |= Result.M
+
+
+
+
+
+            
+            
+            
 
 
             
