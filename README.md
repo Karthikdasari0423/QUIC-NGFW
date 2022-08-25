@@ -57,6 +57,13 @@ Note:-
 To run the "test_retry" interop testcase,you need to provide "--retry" command line argument on machine where your "http3_server.py" is running.
 (--retry demo:app)
 
+4.How to use http3_client_conn_mig.py and Why
+
+Run this file same like as the http3_client.py(python3 examples/http3_client_conn_mig.py --ca-certs tests/pycacert.pem https://172.16.2.2:4433/ -v).
+This script will do the connection migration and will use the new ip address to download the contents.
+This script will do connection migration just before start of content download and not in the middle(Uncomment & comment code depending when you wanted to do connection migration(before start of contents download or after completion of contents download))
+
+
 
 
 
