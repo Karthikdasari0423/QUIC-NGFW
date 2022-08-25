@@ -93,7 +93,7 @@ SERVERS = [
     ),
     Server("gquic", "quic.rocks", retry_port=None),
     Server("lsquic", "http3-test.litespeedtech.com", push_path="/200?push=/100"),
-    Server("kdaquic", "172.16.2.1", port=4433, retry_port=4433, verify_mode=ssl.CERT_NONE,),
+    Server("kdaquic", "172.16.2.2", port=4433, retry_port=4433, verify_mode=ssl.CERT_NONE,),
     Server(
         "msquic",
         "quic.westus.cloudapp.azure.com",
@@ -1166,7 +1166,6 @@ async def test_reset_after_fin(server: Server, configuration: QuicConfiguration)
 
 
 
-
 async def test_handle_new_token_frame_sbc(SERVER: Server, configuration: QuicConfiguration):
     try:
         async with connect(
@@ -1209,6 +1208,7 @@ async def test_handle_new_token_frame_sbc(SERVER: Server, configuration: QuicCon
                     receiver.receive_datagram(data, from_addr, now=time.time())
                 return datagrams
 
+
             def roundtrip(sender, receiver):
                 """
                 Send datagrams from `sender` to `receiver` and back.
@@ -1249,7 +1249,6 @@ async def test_handle_new_token_frame_sbc(SERVER: Server, configuration: QuicCon
                     is_client=False, quic_logger=QuicLogger(), **server_options
                 )
                 server_configuration.load_cert_chain(server_certfile, server_keyfile)
-
                 server = QuicConnection(
                     configuration=server_configuration,
                     original_destination_connection_id=client.original_destination_connection_id,
@@ -1303,7 +1302,6 @@ async def test_handle_new_token_frame_sbc(SERVER: Server, configuration: QuicCon
 
 
 
-
 async def test_connection_migration(server: Server, configuration: QuicConfiguration):
     async with connect(
         server.host, server.port, configuration=configuration
@@ -1353,17 +1351,119 @@ async def test_connection_migration(server: Server, configuration: QuicConfigura
             server.result |= Result.M
 
 
+async def test_connection_migration_spoofed_ip(server: Server, configuration: QuicConfiguration):
+    async with connect(
+        server.host, server.port, configuration=configuration
+    ) as protocol:
+
+        try:
+
+            # cause some traffic
+            await protocol.ping()
+
+            ip_rand = '{}.{}.{}.{}'.format(*__import__('random').sample(range(172, 192), 4))
+            list1 = ["::", 4478]
+            ip_mac = "::ffff:"
+            nm = ip_mac + str(ip_rand)
+            list1[0] = nm
+            addr = tuple(list1)
+            print(addr)
+
+            # replace transport
+            protocol._transport.close()
+            loop = asyncio.get_event_loop()
+            await loop.create_datagram_endpoint(lambda: protocol, local_addr=addr)
+
+            # cause more traffic
+            await protocol.ping()
+
+            # check log
+            path_challenges = 0
+            for event in configuration.quic_logger.to_dict()["traces"][0]["events"]:
+                if (
+                    event["name"] == "transport:packet_received"
+                    and event["data"]["header"]["packet_type"] == "1RTT"
+                ):
+                    for frame in event["data"]["frames"]:
+                        if frame["frame_type"] == "path_challenge":
+                            path_challenges += 1
+            if not path_challenges:
+                protocol._quic._logger.warning("No PATH_CHALLENGE received")
+                server.result |= Result.B
+            else:
+                server.result |= Result.H
+
+        except Exception as e:
+            print(e)
+            server.result |= Result.M
+
+
+async def test_connection_migration_loop(server: Server, configuration: QuicConfiguration):
+    async with connect(
+        server.host, server.port, configuration=configuration
+    ) as protocol:
+        
+        try:
+            
+            for i in range(3,15):
+                import netifaces as ni
+                try:
+                    interface = "eth1:{}".format(i)
+                    ip = ni.ifaddresses(interface)[ni.AF_INET][0]['addr']
+                except Exception as e:
+                    print(e)
+                    ip=None
+    
+                list1 = ["::", 4478]
+                ip_mac = "::ffff:"
+                if ip:
+                    nm = ip_mac + str(ip)
+                    list1[0] = nm
+                    list1[1]=list1[1]+i
+                    addr = tuple(list1)
+                else:
+                    addr = tuple(list1)
+    
+    
+                # cause some traffic
+                await protocol.ping()
+                # change connection ID
+                protocol.change_connection_id()
+                # replace transport
+                protocol._transport.close()
+                loop = asyncio.get_event_loop()
+                await loop.create_datagram_endpoint(lambda: protocol, local_addr=addr)
+                # cause more traffic
+    
+    
+                # change connection ID
+                #protocol.change_connection_id()
+    
+                await protocol.ping()
+    
+                # check log
+    
+                path_challenges = 0
+                for event in configuration.quic_logger.to_dict()["traces"][0]["events"]:
+                    if (
+                        event["name"] == "transport:packet_received"
+                        and event["data"]["header"]["packet_type"] == "1RTT"
+                    ):
+                        for frame in event["data"]["frames"]:
+    
+                            if frame["frame_type"] == "path_challenge":
+                                path_challenges += 1
+            if not path_challenges:
+                protocol._quic._logger.warning("No PATH_CHALLENGE received")
+                server.result |= Result.H
+            else:
+                server.result |= Result.M
+        except Exception as e:
+            print(e)
+            server.result |= Result.H
 
 
 
-            
-            
-            
-
-
-            
-            
-            
 async def test_nat_rebinding(server: Server, configuration: QuicConfiguration):
     async with connect(
         server.host, server.port, configuration=configuration
