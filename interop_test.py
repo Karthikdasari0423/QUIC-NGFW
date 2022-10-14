@@ -144,7 +144,27 @@ async def test_version_negotiation(server: Server, configuration: QuicConfigurat
             ):
                 server.result |= Result.M
 
+                
+async def test_version_negotiation_v2(server: Server, configuration: QuicConfiguration):
+    # force version negotiation
+    configuration.supported_versions.insert(0, 0x709A50C4)
+    ##not sure about hex of QUIC v2,so going forward with Martin hex value 0x709a50c4
+    ## 0xFF020000,0x00000002
 
+    async with connect(
+        server.host, server.port, configuration=configuration
+    ) as protocol:
+        await protocol.ping()
+
+        # check log
+        for event in configuration.quic_logger.to_dict()["traces"][0]["events"]:
+            if (
+                event["name"] == "transport:packet_received"
+                and event["data"]["header"]["packet_type"] == "version_negotiation"
+            ):
+                server.result |= Result.M
+                
+                
 async def test_handshake_and_close(server: Server, configuration: QuicConfiguration):
     async with connect(
         server.host, server.port, configuration=configuration
