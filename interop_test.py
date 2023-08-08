@@ -1560,7 +1560,7 @@ async def test_spin_bit(server: Server, configuration: QuicConfiguration):
             if event["name"] == "connectivity:spin_bit_updated":
                 spin_bits.add(event["data"]["state"])
         if len(spin_bits) == 2:
-            server.result |= Result.P
+            server.result |= Result.M
 
 
 async def test_throughput(server: Server, configuration: QuicConfiguration):
