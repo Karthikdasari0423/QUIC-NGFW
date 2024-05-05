@@ -9,10 +9,9 @@ from collections import deque
 from typing import BinaryIO, Callable, Deque, Dict, List, Optional, Union, cast
 from urllib.parse import urlparse
 
+import aioquic
 import wsproto
 import wsproto.events
-
-import aioquic
 from aioquic.asyncio.client import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.h0.connection import H0_ALPN, H0Connection
@@ -279,7 +278,7 @@ async def perform_http_request(
             is_up = is_interface_up('eth1:3')
             if not is_up:
                 os.system("ifconfig eth1:3 172.16.2.105 netmask 255.255.255.0 up")
-            
+
             try:
                 interface = "eth1:3"
                 ip = ni.ifaddresses(interface)[ni.AF_INET][0]['addr']
@@ -296,7 +295,7 @@ async def perform_http_request(
                 addr_c = tuple(list1_3)
             else:
                 addr_c = tuple(list1_3)
-            
+
             import re
             try:
                 interface_c = "eth1"
@@ -314,30 +313,27 @@ async def perform_http_request(
             if int(nn[-1]) == 1:
                 nm[-1] = '2'
             nm = "".join(nm)
-            ip_chan =ip_mac+str(nm)
+            ip_chan = ip_mac + str(nm)
             list_s[0] = ip_chan
             addr_s = tuple(list_s)
-            
+
             print(addr_c)
             print(addr_s)
             client._transport.close()
-            await loop.create_datagram_endpoint(lambda: client, local_addr=addr_c,remote_addr=addr_s)
+            await loop.create_datagram_endpoint(lambda: client, local_addr=addr_c, remote_addr=addr_s)
             # await loop.create_datagram_endpoint(lambda: client, local_addr=("::",0))
-            #client._quic.change_connection_id()
+            # client._quic.change_connection_id()
 
         ###just before start of file download
         await asyncio.gather(conn_mig())
         task1 = await asyncio.create_task(conn_mig())
         task1
-
         http_events = await client.get(url)
         method = "GET"
-        
         ###just after finish of file download
-        #await asyncio.gather(conn_mig())
-        #task1 = await asyncio.create_task(conn_mig())
-        #task1
-
+        # await asyncio.gather(conn_mig())
+        # task1 = await asyncio.create_task(conn_mig())
+        # task1
     elapsed = time.time() - start
 
     # print speed
@@ -513,7 +509,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cipher-suites",
         type=str,
-        help="only advertise the given cipher suites, e.g. `AES_256_GCM_SHA384,CHACHA20_POLY1305_SHA256`",
+        help=(
+            "only advertise the given cipher suites, e.g. `AES_256_GCM_SHA384,"
+            "CHACHA20_POLY1305_SHA256`"
+        ),
+    )
+    parser.add_argument(
+        "--congestion-control-algorithm",
+        type=str,
+        default="reno",
+        help="use the specified congestion control algorithm",
     )
     parser.add_argument(
         "-d", "--data", type=str, help="send the specified data in a POST request"
@@ -574,6 +579,12 @@ if __name__ == "__main__":
         help="local port to bind for connections",
     )
     parser.add_argument(
+        "--max-datagram-size",
+        type=int,
+        default=defaults.max_datagram_size,
+        help="maximum datagram size to send, excluding UDP or IP overhead",
+    )
+    parser.add_argument(
         "--zero-rtt", action="store_true", help="try to send requests using 0-RTT"
     )
 
@@ -589,7 +600,10 @@ if __name__ == "__main__":
 
     # prepare configuration
     configuration = QuicConfiguration(
-        is_client=True, alpn_protocols=H0_ALPN if args.legacy_http else H3_ALPN
+        is_client=True,
+        alpn_protocols=H0_ALPN if args.legacy_http else H3_ALPN,
+        congestion_control_algorithm=args.congestion_control_algorithm,
+        max_datagram_size=args.max_datagram_size,
     )
     if args.ca_certs:
         configuration.load_verify_locations(args.ca_certs)
