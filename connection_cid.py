@@ -5,7 +5,18 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import Any, Deque, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    FrozenSet,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from .. import tls
 from ..buffer import (
@@ -16,7 +27,8 @@ from ..buffer import (
     size_uint_var,
 )
 from . import events
-from .configuration import QuicConfiguration
+from .configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
+from .congestion.base import K_GRANULARITY
 from .crypto import CryptoError, CryptoPair, KeyUnavailableError
 from .logger import QuicLoggerTrace
 from .packet import (
@@ -46,12 +58,11 @@ from .packet import (
     push_quic_transport_parameters,
 )
 from .packet_builder import (
-    PACKET_MAX_SIZE,
     QuicDeliveryState,
     QuicPacketBuilder,
     QuicPacketBuilderStop,
 )
-from .recovery import K_GRANULARITY, QuicPacketRecovery, QuicPacketSpace
+from .recovery import QuicPacketRecovery, QuicPacketSpace
 from .stream import FinalSizeError, QuicStream, StreamFinishedError
 
 logger = logging.getLogger("quic")
@@ -81,6 +92,7 @@ SECRETS_LABELS = [
 STREAM_FLAGS = 0x07
 STREAM_COUNT_MAX = 0x1000000000000000
 UDP_HEADER_SIZE = 8
+MAX_PENDING_RETIRES = 100
 
 NetworkAddress = Any
 
@@ -208,6 +220,8 @@ class QuicReceiveContext:
     time: float
 
 
+QuicTokenHandler = Callable[[bytes], None]
+
 END_STATES = frozenset(
     [
         QuicConnectionState.CLOSING,
@@ -240,7 +254,12 @@ class QuicConnection:
         retry_source_connection_id: Optional[bytes] = None,
         session_ticket_fetcher: Optional[tls.SessionTicketFetcher] = None,
         session_ticket_handler: Optional[tls.SessionTicketHandler] = None,
+        token_handler: Optional[QuicTokenHandler] = None,
     ) -> None:
+        assert configuration.max_datagram_size >= SMALLEST_MAX_DATAGRAM_SIZE, (
+            "The smallest allowed maximum datagram size is "
+            f"{SMALLEST_MAX_DATAGRAM_SIZE} bytes"
+        )
         if configuration.is_client:
             assert (
                 original_destination_connection_id is None
@@ -249,6 +268,10 @@ class QuicConnection:
                 retry_source_connection_id is None
             ), "Cannot set retry_source_connection_id for a client"
         else:
+            assert token_handler is None, "Cannot set `token_handler` for a server"
+            assert (
+                configuration.token == b""
+            ), "Cannot set `configuration.token` for a server"
             assert (
                 configuration.certificate is not None
             ), "SSL certificate is required for a server"
@@ -303,7 +326,10 @@ class QuicConnection:
         self._local_max_streams_uni = Limit(
             frame_type=QuicFrameType.MAX_STREAMS_UNI, name="max_streams_uni", value=128
         )
+        self._local_next_stream_id_bidi = 0 if self._is_client else 1
+        self._local_next_stream_id_uni = 2 if self._is_client else 3
         self._loss_at: Optional[float] = None
+        self._max_datagram_size = configuration.max_datagram_size
         self._network_paths: List[QuicNetworkPath] = []
         self._pacing_at: Optional[float] = None
         self._packet_number = 0
@@ -313,12 +339,13 @@ class QuicConnection:
         )
         self._peer_cid_available: List[QuicConnectionId] = []
         self._peer_cid_sequence_numbers: Set[int] = set([0])
-        self._peer_token = b""
+        self._peer_retire_prior_to = 0
+        self._peer_token = configuration.token
         self._quic_logger: Optional[QuicLoggerTrace] = None
         self._remote_ack_delay_exponent = 3
         self._remote_active_connection_id_limit = 2
         self._remote_initial_source_connection_id: Optional[bytes] = None
-        self._remote_max_idle_timeout = 0.0  # seconds
+        self._remote_max_idle_timeout: Optional[float] = None  # seconds
         self._remote_max_data = 0
         self._remote_max_data_used = 0
         self._remote_max_datagram_frame_size: Optional[int] = None
@@ -334,6 +361,7 @@ class QuicConnection:
         self._spin_highest_pn = 0
         self._state = QuicConnectionState.FIRSTFLIGHT
         self._streams: Dict[int, QuicStream] = {}
+        self._streams_queue: List[QuicStream] = []
         self._streams_blocked_bidi: List[QuicStream] = []
         self._streams_blocked_uni: List[QuicStream] = []
         self._streams_finished: Set[int] = set()
@@ -359,7 +387,9 @@ class QuicConnection:
 
         # loss recovery
         self._loss = QuicPacketRecovery(
+            congestion_control_algorithm=configuration.congestion_control_algorithm,
             initial_rtt=configuration.initial_rtt,
+            max_datagram_size=self._max_datagram_size,
             peer_completed_address_validation=not self._is_client,
             quic_logger=self._quic_logger,
             send_probe=self._send_probe,
@@ -378,6 +408,7 @@ class QuicConnection:
         # callbacks
         self._session_ticket_fetcher = session_ticket_fetcher
         self._session_ticket_handler = session_ticket_handler
+        self._token_handler = token_handler
 
         # frame handlers
         self.__frame_handlers = {
@@ -430,8 +461,7 @@ class QuicConnection:
         Switch to the next available connection ID and retire
         the previous one.
 
-        After calling this method call :meth:`datagrams_to_send` to retrieve data
-        which needs to be sent.
+        .. aioquic_transmit::
         """
         if self._peer_cid_available:
             # retire previous CID
@@ -440,9 +470,8 @@ class QuicConnection:
             # assign new CID
             self._consume_peer_cid()
 
-
-
-    def change_connection_id_notinlist(self) -> None: #retiring cid and sending cid which is not in list of cid available
+    def change_connection_id_notinlist(
+            self) -> None:  # retiring cid and sending cid which is not in list of cid available
 
         if self._peer_cid_available:
             # retire previous CID
@@ -450,15 +479,15 @@ class QuicConnection:
 
             global rpsid
             rpsid = binascii.unhexlify("0011223344556677")
-            #here using retired cid to send back to list to use as d_cid
-            val2 = QuicConnectionId(cid=rpsid, sequence_number=2, stateless_reset_token=os.urandom(16))#d_cid
-            self._peer_cid_available[1]=val2
+            # here using retired cid to send back to list to use as d_cid
+            val2 = QuicConnectionId(cid=rpsid, sequence_number=2, stateless_reset_token=os.urandom(16))  # d_cid
+            self._peer_cid_available[1] = val2
             # assign new CID
             self._consume_peer_cid()
-            print("after my changes list is",self._peer_cid_available)
-           # print("after my changes is self._host_cids",self._host_cids)
+            print("after my changes list is", self._peer_cid_available)
+        # print("after my changes is self._host_cids",self._host_cids)
 
-    def change_connection_id_rdcid(self) -> None: #send retired cid as again new cid(destination)
+    def change_connection_id_rdcid(self) -> None:  # send retired cid as again new cid(destination)
 
         if self._peer_cid_available:
             # retire previous CID
@@ -466,32 +495,29 @@ class QuicConnection:
             # assign new CID
             self._consume_peer_cid()
             rpsid = self._peer_cid.cid
-            val2 = QuicConnectionId(cid=rpsid, sequence_number=2, stateless_reset_token=os.urandom(16))#d_cid
-            self._peer_cid_available[0]=val2
+            val2 = QuicConnectionId(cid=rpsid, sequence_number=2, stateless_reset_token=os.urandom(16))  # d_cid
+            self._peer_cid_available[0] = val2
 
-            print("after my changes list is",self._peer_cid_available)
-           # print("after my changes is self._host_cids",self._host_cids)
+            print("after my changes list is", self._peer_cid_available)
+        # print("after my changes is self._host_cids",self._host_cids)
 
-
-
-
-    def change_connection_id_rscid(self) -> None:#send retired source id as new source id
+    def change_connection_id_rscid(self) -> None:  # send retired source id as new source id
 
         if self._peer_cid_available:
-            rscid=self.host_cid
-            val1=QuicConnectionId(
+            rscid = self.host_cid
+            val1 = QuicConnectionId(
                 cid=rscid,
                 sequence_number=3,
                 stateless_reset_token=os.urandom(16) if not self._is_client else None,
-                was_sent=True,)            # retire previous CID
+                was_sent=True, )  # retire previous CID
             self._retire_peer_cid(self._peer_cid)
             # assign new CID
             self._consume_peer_cid()
-            self._host_cids[3]=val1
+            self._host_cids[3] = val1
             # print("after my changes list is",self._peer_cid_available)
             print("after my changes is self._host_cids", self._host_cids)
 
-    def change_connection_id_rdcid_as_newscid(self) -> None: #send retired d cid as new s cid
+    def change_connection_id_rdcid_as_newscid(self) -> None:  # send retired d cid as new s cid
         if self._peer_cid_available:
             # retire previous CID
             self._retire_peer_cid(self._peer_cid)
@@ -500,29 +526,25 @@ class QuicConnection:
             rpsid = self._peer_cid.cid
             val3 = QuicConnectionId(cid=rpsid, sequence_number=3, stateless_reset_token=os.urandom(16), was_sent=True)
             self._host_cids[3] = val3
-           # print("after my changes list is",self._peer_cid_available)
-            print("after my changes is self._host_cids",self._host_cids)
+            # print("after my changes list is",self._peer_cid_available)
+            print("after my changes is self._host_cids", self._host_cids)
 
-
-    def change_connection_id_rscid_as_newdcid(self) -> None: #send retired s cid as new d cid
+    def change_connection_id_rscid_as_newdcid(self) -> None:  # send retired s cid as new d cid
         if self._peer_cid_available:
             # retire previous CID
             self._retire_peer_cid(self._peer_cid)
             # assign new CID
             self._consume_peer_cid()
-            rscid=self.host_cid
-            val4=QuicConnectionId(
+            rscid = self.host_cid
+            val4 = QuicConnectionId(
                 cid=rscid,
                 sequence_number=2,
                 stateless_reset_token=os.urandom(16) if not self._is_client else None,
-                was_sent=False,)
+                was_sent=False, )
 
-            self._peer_cid_available[0]=val4
-            print("after my changes list is",self._peer_cid_available)
-           # print("after my changes is self._host_cids",self._host_cids)
-
-
-           
+            self._peer_cid_available[0] = val4
+            print("after my changes list is", self._peer_cid_available)
+        # print("after my changes is self._host_cids",self._host_cids)
 
     def close(
         self,
@@ -532,6 +554,8 @@ class QuicConnection:
     ) -> None:
         """
         Close the connection.
+
+        .. aioquic_transmit::
 
         :param error_code: An error code indicating why the connection is
                            being closed.
@@ -552,8 +576,7 @@ class QuicConnection:
 
         This method can only be called for clients and a single time.
 
-        After calling this method call :meth:`datagrams_to_send` to retrieve data
-        which needs to be sent.
+        .. aioquic_transmit::
 
         :param addr: The network address of the remote peer.
         :param now: The current time.
@@ -586,6 +609,7 @@ class QuicConnection:
         builder = QuicPacketBuilder(
             host_cid=self.host_cid,
             is_client=self._is_client,
+            max_datagram_size=self._max_datagram_size,
             packet_number=self._packet_number,
             peer_cid=self._peer_cid.cid,
             peer_token=self._peer_token,
@@ -624,8 +648,11 @@ class QuicConnection:
             builder.max_flight_bytes = (
                 self._loss.congestion_window - self._loss.bytes_in_flight
             )
-            if self._probe_pending and builder.max_flight_bytes < PACKET_MAX_SIZE:
-                builder.max_flight_bytes = PACKET_MAX_SIZE
+            if (
+                self._probe_pending
+                and builder.max_flight_bytes < self._max_datagram_size
+            ):
+                builder.max_flight_bytes = self._max_datagram_size
 
             # limit data on un-validated network paths
             if not network_path.is_validated:
@@ -668,9 +695,11 @@ class QuicConnection:
                                 "packet_type": self._quic_logger.packet_type(
                                     packet.packet_type
                                 ),
-                                "scid": dump_cid(self.host_cid)
-                                if is_long_header(packet.packet_type)
-                                else "",
+                                "scid": (
+                                    dump_cid(self.host_cid)
+                                    if is_long_header(packet.packet_type)
+                                    else ""
+                                ),
                                 "dcid": dump_cid(self._peer_cid.cid),
                             },
                             "raw": {"length": packet.sent_bytes},
@@ -708,10 +737,10 @@ class QuicConnection:
         """
         Return the stream ID for the next stream created by this endpoint.
         """
-        stream_id = (int(is_unidirectional) << 1) | int(not self._is_client)
-        while stream_id in self._streams or stream_id in self._streams_finished:
-            stream_id += 4
-        return stream_id
+        if is_unidirectional:
+            return self._local_next_stream_id_uni
+        else:
+            return self._local_next_stream_id_bidi
 
     def get_timer(self) -> Optional[float]:
         """
@@ -739,8 +768,7 @@ class QuicConnection:
         """
         Handle the timer.
 
-        After calling this method call :meth:`datagrams_to_send` to retrieve data
-        which needs to be sent.
+        .. aioquic_transmit::
 
         :param now: The current time.
         """
@@ -771,12 +799,22 @@ class QuicConnection:
         except IndexError:
             return None
 
+    def _idle_timeout(self) -> float:
+        # RFC 9000 section 10.1
+
+        # Start with our local timeout.
+        idle_timeout = self._configuration.idle_timeout
+        if self._remote_max_idle_timeout is not None:
+            # Our peer has a preference too, so pick the smaller timeout.
+            idle_timeout = min(idle_timeout, self._remote_max_idle_timeout)
+        # But not too small!
+        return max(idle_timeout, 3 * self._loss.get_probe_timeout())
+
     def receive_datagram(self, data: bytes, addr: NetworkAddress, now: float) -> None:
         """
         Handle an incoming datagram.
 
-        After calling this method call :meth:`datagrams_to_send` to retrieve data
-        which needs to be sent.
+        .. aioquic_transmit::
 
         :param data: The datagram which was received.
         :param addr: The network address from which the datagram was received.
@@ -805,7 +843,7 @@ class QuicConnection:
 
         # for servers, arm the idle timeout on the first datagram
         if self._close_at is None:
-            self._close_at = now + self._configuration.idle_timeout
+            self._close_at = now + self._idle_timeout()
 
         buf = Buffer(data=data)
         while not buf.eof():
@@ -815,6 +853,33 @@ class QuicConnection:
                     buf, host_cid_length=self._configuration.connection_id_length
                 )
             except ValueError:
+                if self._quic_logger is not None:
+                    self._quic_logger.log_event(
+                        category="transport",
+                        event="packet_dropped",
+                        data={
+                            "trigger": "header_parse_error",
+                            "raw": {"length": buf.capacity - start_off},
+                        },
+                    )
+                return
+
+            # RFC 9000 section 14.1 requires servers to drop all initial packets
+            # contained in a datagram smaller than 1200 bytes.
+            if (
+                not self._is_client
+                and header.packet_type == PACKET_TYPE_INITIAL
+                and len(data) < SMALLEST_MAX_DATAGRAM_SIZE
+            ):
+                if self._quic_logger is not None:
+                    self._quic_logger.log_event(
+                        category="transport",
+                        event="packet_dropped",
+                        data={
+                            "trigger": "initial_packet_datagram_too_small",
+                            "raw": {"length": buf.capacity - start_off},
+                        },
+                    )
                 return
 
             # check destination CID matches
@@ -823,7 +888,9 @@ class QuicConnection:
                 if header.destination_cid == connection_id.cid:
                     destination_cid_seq = connection_id.sequence_number
                     break
-            if self._is_client and destination_cid_seq is None:
+            if (
+                self._is_client or header.packet_type == PACKET_TYPE_HANDSHAKE
+            ) and destination_cid_seq is None:
                 if self._quic_logger is not None:
                     self._quic_logger.log_event(
                         category="transport",
@@ -865,7 +932,18 @@ class QuicConnection:
                 common = [
                     x for x in self._configuration.supported_versions if x in versions
                 ]
-                if not common:
+                chosen_version = common[0] if common else None
+                if self._quic_logger is not None:
+                    self._quic_logger.log_event(
+                        category="transport",
+                        event="version_information",
+                        data={
+                            "server_versions": versions,
+                            "client_versions": self._configuration.supported_versions,
+                            "chosen_version": chosen_version,
+                        },
+                    )
+                if chosen_version is None:
                     self._logger.error("Could not find a common protocol version")
                     self._close_event = events.ConnectionTerminated(
                         error_code=QuicErrorCode.INTERNAL_ERROR,
@@ -875,7 +953,7 @@ class QuicConnection:
                     self._close_end()
                     return
                 self._packet_number = 0
-                self._version = QuicProtocolVersion(common[0])
+                self._version = QuicProtocolVersion(chosen_version)
                 self._version_negotiation_count += 1
                 self._logger.info("Retrying with %s", self._version)
                 self._connect(now=now)
@@ -941,6 +1019,7 @@ class QuicConnection:
                         )
                 return
 
+            crypto_frame_required = False
             network_path = self._find_network_path(addr)
 
             # server initialization
@@ -948,6 +1027,7 @@ class QuicConnection:
                 assert (
                     header.packet_type == PACKET_TYPE_INITIAL
                 ), "first packet must be INITIAL"
+                crypto_frame_required = True
                 self._network_paths = [network_path]
                 self._version = QuicProtocolVersion(header.version)
                 self._initialize(header.destination_cid)
@@ -978,8 +1058,8 @@ class QuicConnection:
                         data={"trigger": "key_unavailable"},
                     )
 
-                # if a client receives HANDSHAKE or 1-RTT packets before it has handshake keys,
-                # it can assume that the server's INITIAL was lost
+                # If a client receives HANDSHAKE or 1-RTT packets before it has
+                # handshake keys, it can assume that the server's INITIAL was lost.
                 if (
                     self._is_client
                     and epoch in (tls.Epoch.HANDSHAKE, tls.Epoch.ONE_RTT)
@@ -1075,7 +1155,7 @@ class QuicConnection:
             )
             try:
                 is_ack_eliciting, is_probing = self._payload_received(
-                    context, plain_payload
+                    context, plain_payload, crypto_frame_required=crypto_frame_required
                 )
             except QuicConnectionError as exc:
                 self._logger.warning(exc)
@@ -1088,7 +1168,7 @@ class QuicConnection:
                 return
 
             # update idle timeout
-            self._close_at = now + self._configuration.idle_timeout
+            self._close_at = now + self._idle_timeout()
 
             # handle migration
             if (
@@ -1131,6 +1211,8 @@ class QuicConnection:
     def request_key_update(self) -> None:
         """
         Request an update of the encryption keys.
+
+        .. aioquic_transmit::
         """
         assert self._handshake_complete, "cannot change key before handshake completes"
         self._cryptos[tls.Epoch.ONE_RTT].update_key()
@@ -1138,6 +1220,8 @@ class QuicConnection:
     def reset_stream(self, stream_id: int, error_code: int) -> None:
         """
         Abruptly terminate the sending part of a stream.
+
+        .. aioquic_transmit::
 
         :param stream_id: The stream's ID.
         :param error_code: An error code indicating why the stream is being reset.
@@ -1149,6 +1233,8 @@ class QuicConnection:
         """
         Send a PING frame to the peer.
 
+        .. aioquic_transmit::
+
         :param uid: A unique ID for this PING.
         """
         self._ping_pending.append(uid)
@@ -1156,6 +1242,8 @@ class QuicConnection:
     def send_datagram_frame(self, data: bytes) -> None:
         """
         Send a DATAGRAM frame.
+
+        .. aioquic_transmit::
 
         :param data: The data to be sent.
         """
@@ -1167,6 +1255,8 @@ class QuicConnection:
         """
         Send data on the specific stream.
 
+        .. aioquic_transmit::
+
         :param stream_id: The stream's ID.
         :param data: The data to be sent.
         :param end_stream: If set to `True`, the FIN bit will be set.
@@ -1177,6 +1267,8 @@ class QuicConnection:
     def stop_stream(self, stream_id: int, error_code: int) -> None:
         """
         Request termination of the receiving part of a stream.
+
+        .. aioquic_transmit::
 
         :param stream_id: The stream's ID.
         :param error_code: An error code indicating why the stream is being stopped.
@@ -1266,7 +1358,22 @@ class QuicConnection:
         """
         assert self._is_client
 
-        self._close_at = now + self._configuration.idle_timeout
+        if self._quic_logger is not None:
+            self._quic_logger.log_event(
+                category="transport",
+                event="version_information",
+                data={
+                    "client_versions": self._configuration.supported_versions,
+                    "chosen_version": self._version,
+                },
+            )
+            self._quic_logger.log_event(
+                category="transport",
+                event="alpn_information",
+                data={"client_alpns": self._configuration.alpn_protocols},
+            )
+
+        self._close_at = now + self._idle_timeout()
         self._initialize(self._peer_cid.cid)
 
         self.tls.handle_message(b"", self._crypto_buffers)
@@ -1337,6 +1444,7 @@ class QuicConnection:
                 max_stream_data_remote=max_stream_data_remote,
                 writable=not stream_is_unidirectional(stream_id),
             )
+            self._streams_queue.append(stream)
         return stream
 
     def _get_or_create_stream_for_send(self, stream_id: int) -> QuicStream:
@@ -1367,12 +1475,18 @@ class QuicConnection:
                 streams_blocked = self._streams_blocked_bidi
 
             # create stream
+            is_unidirectional = stream_is_unidirectional(stream_id)
             stream = self._streams[stream_id] = QuicStream(
                 stream_id=stream_id,
                 max_stream_data_local=max_stream_data_local,
                 max_stream_data_remote=max_stream_data_remote,
-                readable=not stream_is_unidirectional(stream_id),
+                readable=not is_unidirectional,
             )
+            self._streams_queue.append(stream)
+            if is_unidirectional:
+                self._local_next_stream_id_uni = stream_id + 4
+            else:
+                self._local_next_stream_id_bidi = stream_id + 4
 
             # mark stream as blocked if needed
             if stream_id // 4 >= max_streams:
@@ -1519,10 +1633,10 @@ class QuicConnection:
             self._loss.peer_completed_address_validation = True
 
         self._loss.on_ack_received(
-            space=self._spaces[context.epoch],
             ack_rangeset=ack_rangeset,
             ack_delay=ack_delay,
             now=context.time,
+            space=self._spaces[context.epoch],
         )
 
     def _handle_connection_close_frame(
@@ -1879,24 +1993,30 @@ class QuicConnection:
                 reason_phrase="Retire Prior To is greater than Sequence Number",
             )
 
+        # only accept retire_prior_to if it is bigger than the one we know
+        self._peer_retire_prior_to = max(retire_prior_to, self._peer_retire_prior_to)
+
         # determine which CIDs to retire
         change_cid = False
-        retire = list(
-            filter(
-                lambda c: c.sequence_number < retire_prior_to, self._peer_cid_available
-            )
-        )
-        if self._peer_cid.sequence_number < retire_prior_to:
+        retire = [
+            cid
+            for cid in self._peer_cid_available
+            if cid.sequence_number < self._peer_retire_prior_to
+        ]
+        if self._peer_cid.sequence_number < self._peer_retire_prior_to:
             change_cid = True
             retire.insert(0, self._peer_cid)
 
         # update available CIDs
-        self._peer_cid_available = list(
-            filter(
-                lambda c: c.sequence_number >= retire_prior_to, self._peer_cid_available
-            )
-        )
-        if sequence_number not in self._peer_cid_sequence_numbers:
+        self._peer_cid_available = [
+            cid
+            for cid in self._peer_cid_available
+            if cid.sequence_number >= self._peer_retire_prior_to
+        ]
+        if (
+            sequence_number >= self._peer_retire_prior_to
+            and sequence_number not in self._peer_cid_sequence_numbers
+        ):
             self._peer_cid_available.append(
                 QuicConnectionId(
                     cid=connection_id,
@@ -1922,6 +2042,21 @@ class QuicConnection:
                 reason_phrase="Too many active connection IDs",
             )
 
+        # Check the number of retired connection IDs pending, though with a safer limit
+        # than the 2x recommended in section 5.1.2 of the RFC.  Note that we are doing
+        # the check here and not in _retire_peer_cid() because we know the frame type to
+        # use here, and because it is the new connection id path that is potentially
+        # dangerous.  We may transiently go a bit over the limit due to unacked frames
+        # getting added back to the list, but that's ok as it is bounded.
+        if len(self._retire_connection_ids) > min(
+            self._local_active_connection_id_limit * 4, MAX_PENDING_RETIRES
+        ):
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
+                frame_type=frame_type,
+                reason_phrase="Too many pending retired connection IDs",
+            )
+
     def _handle_new_token_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
     ) -> None:
@@ -1943,6 +2078,9 @@ class QuicConnection:
                 frame_type=frame_type,
                 reason_phrase="Clients must not send NEW_TOKEN frames",
             )
+
+        if self._token_handler is not None:
+            self._token_handler(token)
 
     def _handle_padding_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -2138,6 +2276,10 @@ class QuicConnection:
         # reset the stream
         stream = self._get_or_create_stream(frame_type, stream_id)
         stream.sender.reset(error_code=QuicErrorCode.NO_ERROR)
+
+        self._events.append(
+            events.StopSendingReceived(error_code=error_code, stream_id=stream_id)
+        )
 
     def _handle_stream_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -2335,30 +2477,42 @@ class QuicConnection:
             self._retire_connection_ids.append(sequence_number)
 
     def _payload_received(
-        self, context: QuicReceiveContext, plain: bytes
+        self,
+        context: QuicReceiveContext,
+        plain: bytes,
+        crypto_frame_required: bool = False,
     ) -> Tuple[bool, bool]:
         """
         Handle a QUIC packet payload.
         """
         buf = Buffer(data=plain)
 
+        crypto_frame_found = False
         frame_found = False
         is_ack_eliciting = False
         is_probing = None
         while not buf.eof():
-            frame_type = buf.pull_uint_var()
+            # get frame type
+            try:
+                frame_type = buf.pull_uint_var()
+            except BufferReadError:
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.FRAME_ENCODING_ERROR,
+                    frame_type=None,
+                    reason_phrase="Malformed frame type",
+                )
 
             # check frame type is known
             try:
                 frame_handler, frame_epochs = self.__frame_handlers[frame_type]
             except KeyError:
                 raise QuicConnectionError(
-                    error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+                    error_code=QuicErrorCode.FRAME_ENCODING_ERROR,
                     frame_type=frame_type,
                     reason_phrase="Unknown frame type",
                 )
 
-            # check frame is allowed for the epoch
+            # check frame type is allowed for the epoch
             if context.epoch not in frame_epochs:
                 raise QuicConnectionError(
                     error_code=QuicErrorCode.PROTOCOL_VIOLATION,
@@ -2382,6 +2536,9 @@ class QuicConnection:
             # update ACK only / probing flags
             frame_found = True
 
+            if frame_type == QuicFrameType.CRYPTO:
+                crypto_frame_found = True
+
             if frame_type not in NON_ACK_ELICITING_FRAME_TYPES:
                 is_ack_eliciting = True
 
@@ -2395,6 +2552,15 @@ class QuicConnection:
                 error_code=QuicErrorCode.PROTOCOL_VIOLATION,
                 frame_type=QuicFrameType.PADDING,
                 reason_phrase="Packet contains no frames",
+            )
+
+        # RFC 9000 - 17.2.2. Initial Packet
+        # The first packet sent by a client always includes a CRYPTO frame.
+        if crypto_frame_required and not crypto_frame_found:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+                frame_type=QuicFrameType.PADDING,
+                reason_phrase="Packet contains no CRYPTO frame",
             )
 
         return is_ack_eliciting, bool(is_probing)
@@ -2418,9 +2584,10 @@ class QuicConnection:
         Retire a destination connection ID.
         """
         self._logger.debug(
-            "Retiring CID %s (%d)",
+            "Retiring CID %s (%d) [%d]",
             dump_cid(connection_id.cid),
             connection_id.sequence_number,
+            len(self._retire_connection_ids) + 1,
         )
         self._retire_connection_ids.append(connection_id.sequence_number)
 
@@ -2533,14 +2700,16 @@ class QuicConnection:
                     frame_type=QuicFrameType.CRYPTO,
                     reason_phrase="max_ack_delay must be < 2^14",
                 )
-            if (
-                quic_transport_parameters.max_udp_payload_size is not None
-                and quic_transport_parameters.max_udp_payload_size < 1200
+            if quic_transport_parameters.max_udp_payload_size is not None and (
+                quic_transport_parameters.max_udp_payload_size
+                < SMALLEST_MAX_DATAGRAM_SIZE
             ):
                 raise QuicConnectionError(
                     error_code=QuicErrorCode.TRANSPORT_PARAMETER_ERROR,
                     frame_type=QuicFrameType.CRYPTO,
-                    reason_phrase="max_udp_payload_size must be >= 1200",
+                    reason_phrase=(
+                        f"max_udp_payload_size must be >= {SMALLEST_MAX_DATAGRAM_SIZE}"
+                    ),
                 )
 
         # store remote parameters
@@ -2597,9 +2766,11 @@ class QuicConnection:
             initial_source_connection_id=self._local_initial_source_connection_id,
             max_ack_delay=25,
             max_datagram_frame_size=self._configuration.max_datagram_frame_size,
-            quantum_readiness=b"Q" * 1200
-            if self._configuration.quantum_readiness_test
-            else None,
+            quantum_readiness=(
+                b"Q" * SMALLEST_MAX_DATAGRAM_SIZE
+                if self._configuration.quantum_readiness_test
+                else None
+            ),
             stateless_reset_token=self._host_cids[0].stateless_reset_token,
         )
         if not self._is_client:
@@ -2620,7 +2791,7 @@ class QuicConnection:
                 ),
             )
 
-        buf = Buffer(capacity=3 * PACKET_MAX_SIZE)
+        buf = Buffer(capacity=3 * self._max_datagram_size)
         push_quic_transport_parameters(buf, quic_transport_parameters)
         return buf.data
 
@@ -2802,34 +2973,54 @@ class QuicConnection:
                 except QuicPacketBuilderStop:
                     break
 
-            for stream in list(self._streams.values()):
-                # if the stream is finished, discard it
-                if stream.is_finished:
-                    self._logger.debug("Stream %d discarded", stream.stream_id)
-                    self._streams.pop(stream.stream_id)
-                    self._streams_finished.add(stream.stream_id)
-                    continue
+            sent: Set[QuicStream] = set()
+            discarded: Set[QuicStream] = set()
+            try:
+                for stream in self._streams_queue:
+                    # if the stream is finished, discard it
+                    if stream.is_finished:
+                        self._logger.debug("Stream %d discarded", stream.stream_id)
+                        self._streams.pop(stream.stream_id)
+                        self._streams_finished.add(stream.stream_id)
+                        discarded.add(stream)
+                        continue
 
-                if stream.receiver.stop_pending:
-                    # STOP_SENDING
-                    self._write_stop_sending_frame(builder=builder, stream=stream)
+                    if stream.receiver.stop_pending:
+                        # STOP_SENDING
+                        self._write_stop_sending_frame(builder=builder, stream=stream)
 
-                if stream.sender.reset_pending:
-                    # RESET_STREAM
-                    self._write_reset_stream_frame(builder=builder, stream=stream)
-                elif not stream.is_blocked and not stream.sender.buffer_is_empty:
-                    # STREAM
-                    self._remote_max_data_used += self._write_stream_frame(
-                        builder=builder,
-                        space=space,
-                        stream=stream,
-                        max_offset=min(
-                            stream.sender.highest_offset
-                            + self._remote_max_data
-                            - self._remote_max_data_used,
-                            stream.max_stream_data_remote,
-                        ),
-                    )
+                    if stream.sender.reset_pending:
+                        # RESET_STREAM
+                        self._write_reset_stream_frame(builder=builder, stream=stream)
+                    elif not stream.is_blocked and not stream.sender.buffer_is_empty:
+                        # STREAM
+                        used = self._write_stream_frame(
+                            builder=builder,
+                            space=space,
+                            stream=stream,
+                            max_offset=min(
+                                stream.sender.highest_offset
+                                + self._remote_max_data
+                                - self._remote_max_data_used,
+                                stream.max_stream_data_remote,
+                            ),
+                        )
+                        self._remote_max_data_used += used
+                        if used > 0:
+                            sent.add(stream)
+
+            finally:
+                # Make a new stream service order, putting served ones at the end.
+                #
+                # This method of updating the streams queue ensures that discarded
+                # streams are removed and ones which sent are moved to the end even
+                # if an exception occurs in the loop.
+                self._streams_queue = [
+                    stream
+                    for stream in self._streams_queue
+                    if not (stream in discarded or stream in sent)
+                ]
+                self._streams_queue.extend(sent)
 
             if builder.packet_is_empty:
                 break
@@ -2995,7 +3186,7 @@ class QuicConnection:
                 QuicFrameType.CRYPTO,
                 capacity=frame_overhead,
                 handler=stream.sender.on_data_delivery,
-                handler_args=(frame.offset, frame.offset + len(frame.data)),
+                handler_args=(frame.offset, frame.offset + len(frame.data), False),
             )
             buf.push_uint_var(frame.offset)
             buf.push_uint16(len(frame.data) | 0x4000)
@@ -3222,7 +3413,7 @@ class QuicConnection:
                 frame_type,
                 capacity=frame_overhead,
                 handler=stream.sender.on_data_delivery,
-                handler_args=(frame.offset, frame.offset + len(frame.data)),
+                handler_args=(frame.offset, frame.offset + len(frame.data), frame.fin),
             )
             buf.push_uint_var(stream.stream_id)
             if frame.offset:
