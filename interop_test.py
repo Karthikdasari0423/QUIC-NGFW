@@ -1011,6 +1011,7 @@ async def test_received_wrong_ietf_version_data(server: Server, configuration: Q
         builder = QuicPacketBuilder(
             host_cid=client._quic._peer_cid.cid,
             is_client=False,
+            max_datagram_size=600,
             peer_cid=client._quic.host_cid,
             version=0xFF001122,  # DRAFT_16
         )
