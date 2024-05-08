@@ -637,7 +637,7 @@ async def test_parallel_conn(server: Server, configuration: QuicConfiguration):
         while (int(p1.stdout) == 0):
             s1="sed -i '354i \ \ \ \ parallel: int,' /root/aioquic/examples/http3_client.py"
             s2="sed -i '422i \ \ \ \ \ \ \ \ \ \ \ \ \ \ \  for i in range(parallel)' /root/aioquic/examples/http3_client.py"
-            s3='''sed -i '509i \ \ \ \ parser.add_argument("--parallel", type=int, default=1, help="perform this many requests in parallel")' /root/aioquic/examples/http3_client.py'''
+            s3='''sed -i '508i \ \ \ \ parser.add_argument("--parallel", type=int, default=1, help="perform this many requests in parallel")' /root/aioquic/examples/http3_client.py'''
             s4="sed -i '575i \ \ \ \ \ \ \ \ \ \ \ \ parallel=args.parallel,' /root/aioquic/examples/http3_client.py"
             l1=[s1,s2,s3,s4]
             for i in (l1):
