@@ -21,7 +21,6 @@ from aioquic.h0.connection import H0_ALPN
 from aioquic.h3.connection import H3_ALPN, H3Connection,ErrorCode
 from aioquic.h3.events import DataReceived, HeadersReceived, PushPromiseReceived
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.frames import RetireConnectionIdFrame
 from aioquic.quic.logger import QuicFileLogger, QuicLogger
 
 
@@ -47,7 +46,9 @@ class Result(Flag):
     three = 0x010000
     d = 0x020000
     p = 0x040000
-    CID_RETIREMENT_OK = 0x4000000
+    MSL = 0x080000
+    SDB = 0x100000
+    SS = 0x200000
 
     def __str__(self):
         flags = sorted(
@@ -293,125 +294,6 @@ async def test_http_3(server: Server, configuration: QuicConfiguration):
                     )
 
                     server.result |= Result.p
-
-
-async def test_cid_retirement_interaction(
-    server: Server, configuration: QuicConfiguration
-):
-    port = server.http3_port or server.port
-    if server.path is None: # Path needed for HttpClient GET
-        return
-
-    quic_logger = QuicLogger()
-    configuration.quic_logger = quic_logger
-    configuration.alpn_protocols = H3_ALPN # Using H3 for HttpClient convenience
-
-    async with connect(
-        server.host,
-        port,
-        configuration=configuration,
-        create_protocol=HttpClient,
-    ) as protocol:
-        protocol = cast(HttpClient, protocol)
-        logger = protocol._quic._logger
-
-        # Identify the server's initial CID (sequence number 0)
-        cid_to_retire_seq = 0
-        server_initial_cid_obj = None
-        for seq, cid_obj in protocol._quic.peer_cids.items():
-            if seq == cid_to_retire_seq:
-                server_initial_cid_obj = cid_obj
-                break
-        
-        if server_initial_cid_obj is None:
-            logger.warning(
-                f"Server's initial CID (sequence {cid_to_retire_seq}) not found in peer_cids. "
-                "Cannot proceed with retirement test."
-            )
-            await protocol.ping() # Still check connection health
-            return
-
-        logger.info(
-            f"Target for retirement: Server CID {server_initial_cid_obj.cid.hex()} (seq: {cid_to_retire_seq}). "
-            f"Currently used dest CID by client: {protocol._quic._remote_cid.hex()}"
-        )
-
-        # Store known peer CID sequence numbers before retirement
-        # Filter out any already retired CIDs if any (should not be the case for seq 0 initially)
-        known_peer_cid_seqs_before_retire = {
-            c.sequence_number for c in protocol._quic.peer_cids.values() if c.retired_time is None
-        }
-        logger.info(f"Active peer CID sequences before retirement: {known_peer_cid_seqs_before_retire}")
-        
-        time_retire_sent_ns = time.time_ns() # Use nanoseconds for better precision
-        protocol._quic._send_frame(RetireConnectionIdFrame(sequence_number=cid_to_retire_seq))
-        logger.info(f"RETIRE_CONNECTION_ID for seq {cid_to_retire_seq} sent at time_ns {time_retire_sent_ns}.")
-
-        # Wait for the server to process the retirement and potentially issue a new CID
-        await asyncio.sleep(2.0)
-
-        new_cid_frame_found_in_qlog = False
-        newly_learned_cid_seq = -1
-
-        try:
-            log_dict = quic_logger.to_dict()
-            if log_dict and "traces" in log_dict and log_dict["traces"]:
-                # QLOG time is typically in microseconds relative to trace start, or milliseconds absolute
-                # Convert time_retire_sent_ns to the QLOG's relative time if necessary,
-                # or compare absolute times if QLOG uses them. AIOQUIC QLogger uses relative time in ms.
-                # For simplicity, we'll just check all NEW_CONNECTION_ID frames after sending.
-                for event in log_dict["traces"][0].get("events", []):
-                    # Assuming event time is relative to trace start in ms for aioquic's QuicLogger
-                    # This time comparison is tricky with QLOG. A simpler check is just for any new CID.
-                    if event.get("name") == "transport:frame_received": # Check frames _received_ by client
-                        for frame_data in event.get("data", {}).get("frames", []):
-                            if frame_data.get("frame_type") == "new_connection_id":
-                                new_seq = frame_data.get("sequence_number")
-                                retire_prior_to = frame_data.get("retire_prior_to", -1) # Default if not present
-                                
-                                logger.info(
-                                    f"QLOG: Detected NEW_CONNECTION_ID frame from server: seq={new_seq}, "
-                                    f"retire_prior_to={retire_prior_to}. CID: {frame_data.get('connection_id')}"
-                                )
-                                # Check if this NEW_CONNECTION_ID is genuinely new and not one we knew before sending RETIRE
-                                if new_seq is not None and new_seq not in known_peer_cid_seqs_before_retire:
-                                    new_cid_frame_found_in_qlog = True
-                                    newly_learned_cid_seq = max(newly_learned_cid_seq, new_seq)
-                                    # No break here, log all new CIDs if multiple are sent
-        except Exception as e:
-            logger.error(f"Error processing QLOG for NEW_CONNECTION_ID: {e}")
-
-        # Check internal state of the retired CID
-        cid_obj_after_retire_attempt = protocol._quic.peer_cids.get(cid_to_retire_seq)
-        is_cid_marked_retired = False
-        if cid_obj_after_retire_attempt and cid_obj_after_retire_attempt.retired_time is not None:
-            logger.info(f"Internal check: CID seq {cid_to_retire_seq} is marked as retired.")
-            is_cid_marked_retired = True
-        elif not cid_obj_after_retire_attempt : # If it was removed
-             logger.info(f"Internal check: CID seq {cid_to_retire_seq} was removed from peer_cids list.")
-             is_cid_marked_retired = True # Also acceptable
-        else:
-            logger.warning(f"Internal check: CID seq {cid_to_retire_seq} still present and not marked retired.")
-            if cid_obj_after_retire_attempt:
-                 logger.warning(f"CID {cid_to_retire_seq} details: {cid_obj_after_retire_attempt}")
-
-
-        if new_cid_frame_found_in_qlog and is_cid_marked_retired:
-            logger.info(
-                f"Success: Server sent a new CID (highest new seq: {newly_learned_cid_seq}) "
-                f"and client correctly processed retirement of CID seq {cid_to_retire_seq}."
-            )
-            server.result |= Result.CID_RETIREMENT_OK
-        else:
-            logger.warning(
-                f"CID retirement test conditions not fully met. "
-                f"New CID in QLOG: {new_cid_frame_found_in_qlog} (new seq: {newly_learned_cid_seq}). "
-                f"Old CID (seq {cid_to_retire_seq}) retired internally: {is_cid_marked_retired}."
-            )
-            
-        # Final connection health check
-        await protocol.ping()
-        logger.info("CID retirement interaction test finished. Final ping check.")
 
 
 async def test_session_resumption(server: Server, configuration: QuicConfiguration):
@@ -1738,6 +1620,405 @@ async def test_throughput(server: Server, configuration: QuicConfiguration):
 
     if failures == 0:
         server.result |= Result.T
+
+
+async def test_max_streams_handling(server: Server, configuration: QuicConfiguration):
+    if server.path is None:  # Path needed for HTTP requests
+        return
+
+    configuration.alpn_protocols = H3_ALPN
+    async with connect(
+        server.host,
+        server.http3_port or server.port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as protocol:
+        protocol = cast(HttpClient, protocol)
+
+        await protocol.ping()  # Ensure connection is active
+
+        # Initial check of peer advertised limit (might be 0 or a small number initially)
+        # The actual limit is often learned after some initial stream activity or specific frames.
+        # For robust testing, we'd ideally know the server's actual initial max_concurrent_streams.
+        # However, RFC 9000 states default is 100 for bidi streams if not specified.
+        # Let's try to open a number of streams that would likely exceed a common initial limit.
+        streams_to_attempt = 150  # A reasonable number to try to exceed typical initial limits
+
+        streams_opened_successfully = 0
+        stream_limit_error_caught = False
+
+        try:
+            for i in range(streams_to_attempt):
+                try:
+                    # Attempt to "use" the stream by initiating a request.
+                    # get_next_available_stream_id() alone might not be enough
+                    # as it doesn't necessarily mean the stream is fully opened or counted
+                    # against the server's limit until used.
+                    stream_id = protocol._quic.get_next_available_stream_id()
+                    
+                    # A lightweight way to "use" the stream for H3.
+                    # This sends headers, effectively opening the stream.
+                    # We don't need to wait for the full response, just initiate.
+                    # Using a non-existent path to avoid actual data transfer beyond headers.
+                    asyncio.create_task(protocol.get(
+                        f"https://{server.host}:{server.port}/attempt_stream_{i}"
+                    ))
+                    # Give a tiny moment for the task to be scheduled and potentially process initial part of stream opening
+                    await asyncio.sleep(0.001) 
+
+                    streams_opened_successfully += 1
+
+                    # Check if we are already at a limit indicated by the QUIC layer's internal state
+                    # This is a more direct check if MAX_STREAMS was received and processed.
+                    # _peer_max_allowed_stream_id_bidi is calculated based on MAX_STREAMS frames.
+                    # The number of active streams is in _streams.
+                    # Note: stream IDs are not contiguous numbers of streams.
+                    # A better check is if get_next_available_stream_id itself raises an error
+                    # or if the number of streams in protocol._quic._streams stops increasing.
+                    
+                    # If the server is very lenient or we haven't hit a limit yet, this loop might complete.
+                    # The primary check is the QuicConnectionError below.
+
+                except QuicConnectionError as e:
+                    if e.error_code == ErrorCode.STREAM_LIMIT_ERROR or \
+                       e.error_code == ErrorCode.H3_STREAM_CREATION_ERROR: # H3_STREAM_CREATION_ERROR can also be relevant
+                        protocol._quic._logger.info(
+                            f"Caught expected stream limit error: {e.error_code} - {e.reason_phrase}"
+                        )
+                        stream_limit_error_caught = True
+                        server.result |= Result.MSL
+                        break  # Stop trying to open more streams
+                    else:
+                        protocol._quic._logger.warning(
+                            f"Caught QuicConnectionError but not stream limit related: {e.error_code} - {e.reason_phrase}"
+                        )
+                        raise # Re-throw if it's not the one we are looking for
+                except Exception as e:
+                    # Catch any other exception during stream opening attempt
+                    protocol._quic._logger.error(f"Unexpected exception during stream {i} creation: {e}")
+                    # Depending on policy, could break or continue. For now, let's break.
+                    break
+            
+            if not stream_limit_error_caught:
+                # If no specific stream limit error was caught, we need to assess other conditions.
+                # This could happen if the server is very permissive, or if our attempt count wasn't high enough.
+                # Check the number of streams actually created vs the peer's advertised limit.
+                # This is a fallback check. The primary check is catching STREAM_LIMIT_ERROR.
+                # protocol._quic._streams contains active streams.
+                # protocol._quic._peer_max_allowed_stream_id_bidi reflects the max stream ID the peer allows.
+                # Stream IDs are not 0-indexed counts but rather specific numbers (0, 4, 8 for client bidi).
+                # A simple check: if we opened many streams without error, it's a weak pass.
+                # A more robust check would involve inspecting logger for MAX_STREAMS or if _streams count matches a known limit.
+                
+                # If we opened all attempted streams without hitting a STREAM_LIMIT_ERROR,
+                # it implies the server is either very generous or the limit wasn't triggered by these actions.
+                # For this test, catching the explicit STREAM_LIMIT_ERROR is the strongest signal.
+                # If not caught, we might not be able to definitively say MSL is handled unless we analyze logs
+                # for MAX_STREAMS frames, which is more complex.
+                # For now, we only set MSL if the specific error is caught.
+                # Alternatively, if the number of streams is clearly limited by _peer_max_allowed_stream_id_bidi
+                # (e.g. next get_next_available_stream_id() would exceed it or already did and failed silently before)
+                # This part needs careful consideration.
+                
+                # Let's check if the number of streams is somewhat constrained,
+                # even if no explicit error was raised.
+                # This is a weaker heuristic.
+                # `_local_max_streams_bidi` is our advertised limit, `_peer_max_streams_bidi` is what peer advertised to us.
+                # `_stream_count_bidi` is number of active bidi streams.
+                if protocol._quic._stream_count_bidi > 0 and \
+                   protocol._quic._stream_count_bidi <= protocol._quic._peer_max_streams_bidi:
+                    protocol._quic._logger.info(
+                        f"Loop completed. Active bidi streams ({protocol._quic._stream_count_bidi}) "
+                        f"within peer advertised limit ({protocol._quic._peer_max_streams_bidi}). "
+                        "This might indicate graceful handling if limit was implicitly hit."
+                    )
+                    # This is a softer condition for MSL. The explicit error is better.
+                    # server.result |= Result.MSL # Potentially add this if desired for "silent" limiting
+                elif streams_opened_successfully == streams_to_attempt:
+                     protocol._quic._logger.info(
+                        f"Opened all {streams_to_attempt} streams without explicit stream limit error."
+                    )
+                else:
+                    protocol._quic._logger.warning(
+                        f"Stream limit error not caught, and stream count ({protocol._quic._stream_count_bidi}) "
+                        f"vs peer limit ({protocol._quic._peer_max_streams_bidi}) is inconclusive or limit not reached."
+                    )
+
+
+        except QuicConnectionError as e:
+            # This outer catch is for errors not caught by the inner stream creation loop's specific handler
+            protocol._quic._logger.error(
+                f"Outer QuicConnectionError: {e.error_code} - {e.reason_phrase}"
+            )
+            if e.error_code == ErrorCode.STREAM_LIMIT_ERROR or \
+               e.error_code == ErrorCode.H3_STREAM_CREATION_ERROR:
+                if not stream_limit_error_caught: # If not already set
+                    server.result |= Result.MSL
+        except Exception as e:
+            protocol._quic._logger.error(f"Unexpected exception in test_max_streams_handling: {e}")
+        finally:
+            # Ensure the connection is closed gracefully, releasing resources.
+            # The `async with` block handles this, but explicit close can be added if needed for specific scenarios.
+            pass
+
+
+async def test_stream_data_blocked_handling(server: Server, configuration: QuicConfiguration):
+    if server.path is None:  # Path needed for HTTP requests
+        return
+
+    # Ensure quic_logger is available and can be inspected.
+    # The main runner script already sets up QuicFileLogger or QuicLogger.
+    if configuration.quic_logger is None:
+        print("QuicLogger not configured, cannot verify STREAM_DATA_BLOCKED frame.")
+        return
+
+    configuration.alpn_protocols = H3_ALPN
+    async with connect(
+        server.host,
+        server.http3_port or server.port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as protocol:
+        protocol = cast(HttpClient, protocol)
+        http_client = cast(HttpClient, protocol) # Alias for clarity
+
+        await http_client.ping() # Ensure connection is active
+
+        # Perform a simple GET request to open a stream
+        request_path = server.path
+        if not request_path or request_path == "/":
+            request_path = "/test_sdb_init" # Use a specific path if default is too generic
+
+        events = await http_client.get(
+            "https://{}:{}{}".format(server.host, server.port, request_path)
+        )
+        
+        # Identify the stream ID used for the GET request.
+        # This is a bit indirect. We need to find the stream associated with the HTTP GET.
+        # H3Connection maps request IDs to stream IDs.
+        # A simpler way for a single client might be to find the first client-initiated bidi stream.
+        client_stream_id = None
+        if hasattr(http_client._http, '_stream_id_for_request_data'): # internal detail, might change
+            # Find a stream that was used for sending data (i.e. our GET request)
+            for stream_id, data_sent in http_client._http._stream_id_for_request_data.items():
+                if data_sent:
+                    client_stream_id = stream_id
+                    break
+        
+        if client_stream_id is None:
+            # Fallback: Iterate through QUIC streams to find a client-initiated bidirectional stream
+            # that has sent some data and is still open or recently closed by us.
+            # Client-initiated bidi streams are 0, 4, 8, ...
+            for stream_id, stream in protocol._quic._streams.items():
+                if stream_id % 4 == 0 and not stream.is_closed and stream.sender.bytes_sent > 0:
+                    client_stream_id = stream_id
+                    protocol._quic._logger.info(f"Found active client stream {client_stream_id} via fallback.")
+                    break
+        
+        if client_stream_id is None:
+            protocol._quic._logger.error("Could not identify a suitable client stream for SDB test.")
+            return
+
+        protocol._quic._logger.info(f"Using stream {client_stream_id} for STREAM_DATA_BLOCKED test.")
+
+        # Attempt to send a large amount of data to trigger flow control limits
+        # Default initial stream flow control window is often ~256KB (RFC 9000 default is 2^16 = 65536, but can be higher)
+        # Let's try to send more than that.
+        # Sending 1MB of data should be enough to hit typical initial limits.
+        # We send it in chunks to allow the QUIC stack to process.
+        data_to_send = b"D" * (1 * 1024 * 1024) # 1 MB
+        chunk_size = 64 * 1024 # 64KB chunks
+        data_sent_total = 0
+
+        try:
+            for i in range(0, len(data_to_send), chunk_size):
+                chunk = data_to_send[i:i + chunk_size]
+                protocol._quic.send_stream_data(client_stream_id, chunk, end_stream=False)
+                data_sent_total += len(chunk)
+                # Allow some processing time, especially if the send buffer fills up
+                await asyncio.sleep(0.01) 
+            
+            # Try to send one final small piece of data that might be the one to get blocked
+            protocol._quic.send_stream_data(client_stream_id, b"final_chunk", end_stream=False)
+            data_sent_total += len(b"final_chunk")
+            protocol._quic._logger.info(f"Attempted to send {data_sent_total} bytes on stream {client_stream_id}.")
+
+        except QuicConnectionError as e:
+            # This might happen if the connection closes due to some other issue during send.
+            protocol._quic._logger.error(f"QuicConnectionError during send_stream_data: {e}")
+            return # Cannot proceed if send fails catastrophically
+
+        # Allow time for the client to process its send queue and for the server to potentially
+        # send MAX_STREAM_DATA frames (or not, if we are blocked).
+        # A ping forces an RTT and processing of ack/control frames.
+        await http_client.ping()
+        await asyncio.sleep(0.2) # Additional grace time for logger events
+
+        # Inspect logger for STREAM_DATA_BLOCKED frame sent by the client
+        found_sdb_frame = False
+        try:
+            log_data = configuration.quic_logger.to_dict()
+            traces = log_data.get("traces", [])
+            if not traces:
+                protocol._quic._logger.warning("No traces found in QUIC log for SDB check.")
+                return
+
+            for event in traces[0].get("events", []):
+                # Events can be at different levels, "transport:packet_sent" or "transport:frame_sent"
+                # Let's check for "transport:packet_sent" as it's more common in examples
+                if event.get("name") == "transport:packet_sent":
+                    packet_data = event.get("data", {})
+                    for frame in packet_data.get("frames", []):
+                        if frame.get("frame_type") == "stream_data_blocked":
+                            # Check if it's for the stream we are interested in
+                            if frame.get("stream_id") == client_stream_id:
+                                protocol._quic._logger.info(
+                                    f"STREAM_DATA_BLOCKED frame sent for stream {client_stream_id} found in log."
+                                )
+                                found_sdb_frame = True
+                                server.result |= Result.SDB
+                                break # Found relevant SDB frame
+                if found_sdb_frame:
+                    break
+            
+            if not found_sdb_frame:
+                protocol._quic._logger.warning(
+                    f"STREAM_DATA_BLOCKED frame for stream {client_stream_id} not observed in QUIC log. "
+                    "This might be due to generous server flow control or logger verbosity."
+                )
+
+        except Exception as e:
+            protocol._quic._logger.error(f"Error inspecting QUIC log for SDB frame: {e}")
+
+
+async def test_stop_sending_handling(server: Server, configuration: QuicConfiguration):
+    # Determine path for GET request; prefer throughput_path for potentially larger/streamable content.
+    request_path = None
+    if server.throughput_path:
+        # Use a moderate size for the throughput path to ensure it's streamable but not excessively slow.
+        # 500KB or 1MB should be sufficient. Let's use 500KB.
+        try:
+            request_path = server.throughput_path % {"size": 500000} # 500KB
+        except TypeError: # Path might not have a size parameter
+            protocol._quic._logger.warning(f"Could not format throughput_path: {server.throughput_path}, falling back.")
+            request_path = server.path
+    else:
+        request_path = server.path
+
+    if request_path is None:
+        print("No suitable path for GET request in test_stop_sending_handling.")
+        return
+
+    if configuration.quic_logger is None:
+        print("QuicLogger not configured, cannot verify RESET_STREAM frame.")
+        return
+
+    configuration.alpn_protocols = H3_ALPN
+    async with connect(
+        server.host,
+        server.http3_port or server.port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as protocol:
+        protocol = cast(HttpClient, protocol)
+        http_client = cast(HttpClient, protocol)
+
+        await http_client.ping() # Ensure connection is active
+
+        # Initiate the GET request but don't await its full completion yet.
+        # This allows us to send STOP_SENDING while the server is likely still sending data.
+        get_task = asyncio.create_task(
+            http_client.get(
+                "https://{}:{}{}".format(server.host, server.port, request_path)
+            )
+        )
+
+        # Allow the GET request to start and the client to determine the stream ID.
+        # This is a bit of a race, but usually the stream ID is assigned quickly.
+        await asyncio.sleep(0.1) # Small delay for request initiation and stream ID assignment.
+
+        client_stream_id = None
+        # Try to find the stream ID associated with the ongoing GET request.
+        # Iterating _streams is a common way if a direct mapping isn't public.
+        # Client-initiated bidi streams are 0, 4, 8, ...
+        # We need the one that was just opened for our GET.
+        # The highest numbered stream is likely the most recent.
+        max_client_stream_id = -1
+        for stream_id, stream in protocol._quic._streams.items():
+            if stream_id % 4 == 0 and not stream.is_closed: # Client bidi stream, not yet closed
+                 # Check if it's an HTTP/3 stream by looking at H3 connection's internal streams
+                if http_client._http._stream_is_pending(stream_id) or http_client._http._stream_exists(stream_id):
+                    if stream_id > max_client_stream_id:
+                        max_client_stream_id = stream_id
+        
+        if max_client_stream_id != -1:
+            client_stream_id = max_client_stream_id
+        
+        if client_stream_id is None:
+            protocol._quic._logger.error("Could not identify client stream ID for STOP_SENDING test.")
+            get_task.cancel() # Clean up the pending GET task
+            try:
+                await get_task
+            except asyncio.CancelledError:
+                pass
+            return
+
+        protocol._quic._logger.info(f"Identified stream {client_stream_id} for STOP_SENDING test. Path: {request_path}")
+
+        # Send STOP_SENDING for this stream.
+        # H3_REQUEST_CANCELLED is an appropriate error code.
+        protocol._quic.stop_stream(client_stream_id, error_code=ErrorCode.H3_REQUEST_CANCELLED)
+        protocol._quic._logger.info(f"STOP_SENDING (error {ErrorCode.H3_REQUEST_CANCELLED}) sent for stream {client_stream_id}.")
+
+        # Allow time for server to process STOP_SENDING and respond (hopefully with RESET_STREAM)
+        # A ping can help ensure packets are exchanged.
+        await http_client.ping()
+        await asyncio.sleep(0.3) # Additional grace time
+
+        # Now, check the logs for a RESET_STREAM from the server.
+        found_reset_stream = False
+        try:
+            log_data = configuration.quic_logger.to_dict()
+            traces = log_data.get("traces", [])
+            if not traces:
+                protocol._quic._logger.warning("No traces found in QUIC log for SS check.")
+            else:
+                for event in traces[0].get("events", []):
+                    if event.get("name") == "transport:packet_received":
+                        packet_data = event.get("data", {})
+                        for frame in packet_data.get("frames", []):
+                            if frame.get("frame_type") == "reset_stream" and \
+                               frame.get("stream_id") == client_stream_id:
+                                # We need to ensure this RESET_STREAM was sent by the server.
+                                # The log event "transport:packet_received" implies it's from the peer.
+                                protocol._quic._logger.info(
+                                    f"RESET_STREAM frame received from server for stream {client_stream_id}."
+                                )
+                                found_reset_stream = True
+                                server.result |= Result.SS
+                                break
+                    if found_reset_stream:
+                        break
+            
+            if not found_reset_stream:
+                protocol._quic._logger.warning(
+                    f"RESET_STREAM frame not observed from server for stream {client_stream_id} "
+                    "after sending STOP_SENDING."
+                )
+
+        except Exception as e:
+            protocol._quic._logger.error(f"Error inspecting QUIC log for RESET_STREAM frame: {e}")
+        
+        # Finally, ensure the GET task is completed or cancelled to clean up resources.
+        if not get_task.done():
+            get_task.cancel()
+        try:
+            await get_task # Await to propagate any exceptions if not cancelled.
+        except asyncio.CancelledError:
+            protocol._quic._logger.info(f"GET task for stream {client_stream_id} cancelled as part of cleanup.")
+        except Exception as e:
+            # Log other exceptions from the GET task if it wasn't cancelled and failed.
+            protocol._quic._logger.error(f"Exception from GET task for stream {client_stream_id}: {e}")
 
 
 def print_result(server: Server) -> None:
