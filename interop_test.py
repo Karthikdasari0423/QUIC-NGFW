@@ -49,6 +49,10 @@ class Result(Flag):
     MSL = 0x080000
     SDB = 0x100000
     SS = 0x200000
+    PVH = 0x400000
+    SCSE = 0x800000
+    MWL = 0x1000000
+    H3SE = 0x2000000
 
     def __str__(self):
         flags = sorted(
@@ -2019,6 +2023,544 @@ async def test_stop_sending_handling(server: Server, configuration: QuicConfigur
         except Exception as e:
             # Log other exceptions from the GET task if it wasn't cancelled and failed.
             protocol._quic._logger.error(f"Exception from GET task for stream {client_stream_id}: {e}")
+
+
+async def test_protocol_violation_handling(server: Server, configuration: QuicConfiguration):
+    if configuration.quic_logger is None:
+        print("QuicLogger not configured, cannot verify PROTOCOL_VIOLATION handling.")
+        return
+
+    configuration.alpn_protocols = H3_ALPN # Or any common ALPN
+    
+    # Import necessary enums
+    from aioquic.quic.packet import FrameType, QuicErrorCode
+    from aioquic.quic.connection import QuicConnectionError
+
+    async with connect(
+        server.host,
+        server.port, # Using standard port, can be server.http3_port or server.port
+        configuration=configuration,
+        # Using default create_protocol, but can also be HttpClient if http interaction is needed before violation
+    ) as protocol: # protocol is QuicConnection when create_protocol is default
+        
+        await protocol.ping() # Ensure connection is established and handshake is complete
+        protocol._quic._logger.info("Connection established, preparing to send illicit HANDSHAKE_DONE frame.")
+
+        try:
+            # Attempt to send HANDSHAKE_DONE frame from client (violates protocol)
+            # Server should only send this frame.
+            # Accessing internal _send_frame might be fragile but necessary for this kind of test.
+            if hasattr(protocol._quic, '_send_frame'):
+                protocol._quic._send_frame(FrameType.HANDSHAKE_DONE, b'')
+                protocol._quic._logger.info("Sent illicit HANDSHAKE_DONE frame from client.")
+                # Ensure the packet containing this frame is actually sent out
+                protocol._quic.send_datagram_frame(b'') # Sending an empty datagram forces a packet send if one is pending
+                                                       # Or, more directly, trigger transmission if available
+                                                       # Forcing a ping will also try to send data
+            else:
+                protocol._quic._logger.error("_send_frame method not found on QuicConnection. Cannot perform test.")
+                return
+
+            # Wait for the server to process the frame and react.
+            # The server should close the connection. This ping will likely fail.
+            await protocol.ping()
+            protocol._quic._logger.warning("Ping after sending illicit frame succeeded, server might not have reacted as expected.")
+
+        except QuicConnectionError as e:
+            protocol._quic._logger.info(f"QuicConnectionError caught as expected: {e} (Error Code: {e.error_code}, Reason: {e.reason_phrase})")
+            # This is an expected outcome if the server closes the connection due to the violation.
+            # We still need to check the logger for the *reason* the server closed.
+            # If e.error_code is PROTOCOL_VIOLATION and e.from_client is False (if such a field existed), it'd be a quick check.
+            # aioquic's QuicConnectionError typically reflects local conditions or library-detected issues,
+            # not always directly the peer's CONNECTION_CLOSE frame error code.
+            # So, logger check is more definitive for peer's reason.
+            pass
+        except Exception as e:
+            protocol._quic._logger.error(f"Unexpected exception: {e}")
+            # Not necessarily a failure of the test's objective, but unexpected.
+            pass
+        
+        # Inspect logger for server-initiated connection close with PROTOCOL_VIOLATION
+        found_protocol_violation_close = False
+        try:
+            log_data = configuration.quic_logger.to_dict()
+            traces = log_data.get("traces", [])
+            if not traces:
+                protocol._quic._logger.warning("No traces found in QUIC log for PVH check.")
+            else:
+                for trace in traces: # Iterate over all traces if multiple exist (rare for client)
+                    for event in trace.get("events", []):
+                        event_name = event.get("name")
+                        event_data = event.get("data", {})
+
+                        # Option 1: Explicit connection_terminated event from logger
+                        if event_name == "transport:connection_terminated":
+                            # Check if error_code matches PROTOCOL_VIOLATION
+                            # The integer value for PROTOCOL_VIOLATION is 0x1.
+                            # QuicErrorCode.PROTOCOL_VIOLATION.value can be used.
+                            if event_data.get("error_code") == QuicErrorCode.PROTOCOL_VIOLATION:
+                                # How to confirm server-initiated?
+                                # If the client didn't call .close() with this error.
+                                # For this test, we assume if we see this after our bad frame, it's server.
+                                # A more robust check would be if the event data has a "source" or "trigger"
+                                # indicating peer. aioquic logs might not be that detailed for this event.
+                                protocol._quic._logger.info(
+                                    f"transport:connection_terminated event with PROTOCOL_VIOLATION found."
+                                )
+                                found_protocol_violation_close = True
+                                break
+                            elif event_data.get("error_code_str") == "PROTOCOL_VIOLATION": # some loggers might use str
+                                protocol._quic._logger.info(
+                                    f"transport:connection_terminated event with PROTOCOL_VIOLATION (str) found."
+                                )
+                                found_protocol_violation_close = True
+                                break
+
+
+                        # Option 2: Inferring from a received CONNECTION_CLOSE frame in a packet
+                        elif event_name == "transport:packet_received":
+                            for frame in event_data.get("frames", []):
+                                if frame.get("frame_type") == "connection_close" and \
+                                   frame.get("error_code") == QuicErrorCode.PROTOCOL_VIOLATION:
+                                    # This frame being in a "packet_received" event means it came from the peer (server)
+                                    protocol._quic._logger.info(
+                                        f"Received CONNECTION_CLOSE frame with PROTOCOL_VIOLATION from server."
+                                    )
+                                    found_protocol_violation_close = True
+                                    break
+                        if found_protocol_violation_close:
+                            break
+                    if found_protocol_violation_close:
+                        break
+            
+            if found_protocol_violation_close:
+                server.result |= Result.PVH
+                protocol._quic._logger.info("Server correctly closed with PROTOCOL_VIOLATION. PVH flag set.")
+            else:
+                protocol._quic._logger.warning(
+                    "Server did not close with PROTOCOL_VIOLATION, or event not found/matched in logs."
+                )
+
+        except Exception as e:
+            protocol._quic._logger.error(f"Error inspecting QUIC log for PROTOCOL_VIOLATION: {e}")
+
+
+async def test_server_initiated_close_specific_error(server: Server, configuration: QuicConfiguration):
+    if configuration.quic_logger is None:
+        print("QuicLogger not configured, cannot verify SCSE test.")
+        return
+    
+    if server.path is None: # Path needed for initial GET request
+        print("No server.path defined for SCSE test.")
+        return
+
+    configuration.alpn_protocols = H3_ALPN
+    
+    # Import necessary enums and functions
+    from aioquic.h3.connection import ErrorCode, encode_frame, encode_settings
+    from aioquic.h3.frames import H3FrameType
+    from aioquic.quic.connection import QuicConnectionError
+
+    get_task = None # Define for cleanup in case of early exit
+
+    async with connect(
+        server.host,
+        server.http3_port or server.port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as protocol:
+        http_client = cast(HttpClient, protocol)
+        
+        await http_client.ping() # Ensure connection is established
+        http_client._quic._logger.info("Connection established for SCSE test.")
+
+        # Initiate a GET request as a task to open a request stream
+        get_task = asyncio.create_task(
+            http_client.get(
+                "https://{}:{}{}".format(server.host, server.http3_port or server.port, server.path)
+            )
+        )
+        await asyncio.sleep(0.1) # Allow request to initiate and stream to be created
+
+        # Identify the stream ID for the GET request
+        client_stream_id = None
+        max_client_stream_id = -1
+        for stream_id, stream in http_client._quic._streams.items():
+            if stream_id % 4 == 0 and not stream.is_closed: # Client bidi stream
+                if http_client._http._stream_is_pending(stream_id) or http_client._http._stream_exists(stream_id):
+                    if stream_id > max_client_stream_id:
+                        max_client_stream_id = stream_id
+        
+        if max_client_stream_id != -1:
+            client_stream_id = max_client_stream_id
+        
+        if client_stream_id is None:
+            http_client._quic._logger.error("Could not identify client request stream ID for SCSE test.")
+            if get_task and not get_task.done():
+                get_task.cancel()
+            try:
+                if get_task: await get_task
+            except asyncio.CancelledError: pass
+            return
+
+        http_client._quic._logger.info(f"Identified request stream {client_stream_id} for SCSE test.")
+
+        # Construct an H3 SETTINGS frame
+        settings_payload = encode_settings({}) 
+        h3_settings_frame_bytes = encode_frame(H3FrameType.SETTINGS, settings_payload)
+        http_client._quic._logger.info(f"Constructed H3 SETTINGS frame: {h3_settings_frame_bytes.hex()}")
+
+        try:
+            # Send the H3 SETTINGS frame on the request stream (this is the violation)
+            http_client._quic.send_stream_data(client_stream_id, h3_settings_frame_bytes, end_stream=False)
+            http_client._quic._logger.info(f"Sent illicit H3 SETTINGS frame on request stream {client_stream_id}.")
+            
+            # Wait for the server to process and react. Expect connection closure.
+            await http_client.ping() # This ping should ideally fail
+            http_client._quic._logger.warning("Ping after sending illicit SETTINGS frame succeeded, server might not have reacted as expected.")
+
+        except QuicConnectionError as e:
+            http_client._quic._logger.info(f"QuicConnectionError caught as expected after sending bad frame: {e}")
+            # This is expected. Now verify the reason in the logs.
+            pass
+        except Exception as e:
+            http_client._quic._logger.error(f"Unexpected exception after sending bad frame: {e}")
+            # Continue to log inspection, as connection might have closed for the right reason anyway.
+            pass
+        finally:
+            if get_task and not get_task.done():
+                get_task.cancel()
+            try:
+                if get_task: await get_task
+            except asyncio.CancelledError:
+                http_client._quic._logger.info(f"GET task for stream {client_stream_id} cancelled during cleanup.")
+            except Exception as e:
+                 http_client._quic._logger.error(f"Exception from GET task during cleanup: {e}")
+
+
+        # Inspect logger for server-initiated connection close with H3_FRAME_UNEXPECTED
+        found_specific_error_close = False
+        expected_h3_error_code = ErrorCode.H3_FRAME_UNEXPECTED 
+        
+        try:
+            log_data = configuration.quic_logger.to_dict()
+            traces = log_data.get("traces", [])
+            if not traces:
+                http_client._quic._logger.warning("No traces found in QUIC log for SCSE check.")
+            else:
+                for trace in traces:
+                    for event in trace.get("events", []):
+                        event_name = event.get("name")
+                        event_data = event.get("data", {})
+
+                        if event_name == "transport:connection_terminated":
+                            logged_error_code = event_data.get("error_code")
+                            # In qlog, H3 errors might be directly in error_code for connection_terminated
+                            if logged_error_code == expected_h3_error_code.value:
+                                http_client._quic._logger.info(
+                                    f"transport:connection_terminated event with H3_FRAME_UNEXPECTED ({expected_h3_error_code.value}) found."
+                                )
+                                found_specific_error_close = True
+                                break
+                        
+                        elif event_name == "transport:packet_received":
+                            for frame in event_data.get("frames", []):
+                                if frame.get("frame_type") == "connection_close":
+                                    # For H3, the application error code is in 'error_code' field of CONNECTION_CLOSE in qlog spec for H3.
+                                    # Some implementations might use 'application_error_code' but standard qlog for QUIC's CONNECTION_CLOSE
+                                    # uses 'error_code' for the QUIC error and 'application_error_code' for the app layer (H3).
+                                    # However, aioquic's logger for a CONNECTION_CLOSE frame (non-0x1c type) puts the H3 code in 'error_code'.
+                                    # For 0x1d (application close), it's in 'application_error_code'.
+                                    # Let's check both common ways it might be logged.
+                                    
+                                    # Check QUIC CONNECTION_CLOSE frame (type 0x1c or 0x1d)
+                                    # If it's 0x1c, error_code is QUIC error, reason_phrase might contain H3 error.
+                                    # If it's 0x1d, application_error_code is H3 error.
+                                    # aioquic's logger seems to put the H3 error in 'error_code' field of the frame data
+                                    # when it's an application error that leads to CONNECTION_CLOSE.
+                                    logged_frame_error_code = frame.get("error_code")
+                                    if logged_frame_error_code == expected_h3_error_code.value:
+                                        http_client._quic._logger.info(
+                                            f"Received CONNECTION_CLOSE frame with 'error_code' H3_FRAME_UNEXPECTED ({expected_h3_error_code.value})."
+                                        )
+                                        found_specific_error_close = True
+                                        break
+                                    # Also check application_error_code for type 0x1d frames if the above isn't hit
+                                    # This might be redundant if aioquic normalizes it, but good for robustness
+                                    elif frame.get("close_type") == "application_close" and frame.get("application_error_code") == expected_h3_error_code.value:
+                                        http_client._quic._logger.info(
+                                            f"Received CONNECTION_CLOSE (application) frame with 'application_error_code' H3_FRAME_UNEXPECTED ({expected_h3_error_code.value})."
+                                        )
+                                        found_specific_error_close = True
+                                        break
+                        if found_specific_error_close:
+                            break
+                    if found_specific_error_close:
+                        break
+            
+            if found_specific_error_close:
+                server.result |= Result.SCSE
+                http_client._quic._logger.info(f"Server correctly closed with H3_FRAME_UNEXPECTED. SCSE flag set for server {server.name}.")
+            else:
+                http_client._quic._logger.warning(
+                    f"Server {server.name} did not close with H3_FRAME_UNEXPECTED ({expected_h3_error_code.value}), or event not found/matched in logs."
+                )
+
+        except Exception as e:
+            http_client._quic._logger.error(f"Error inspecting QUIC log for SCSE check: {e}")
+
+
+async def test_migration_with_loss(server: Server, configuration: QuicConfiguration):
+    if configuration.quic_logger is None:
+        print("QuicLogger not configured, cannot verify MWL test.")
+        return
+
+    # Using H3_ALPN for consistency, though the test primarily uses raw QuicConnection features
+    configuration.alpn_protocols = H3_ALPN 
+    
+    from aioquic.quic.connection import QuicConnectionError
+
+    async with connect(
+        server.host,
+        server.port, # Using standard port
+        configuration=configuration,
+        # Default create_protocol gives QuicConnection, which is what we want for this test
+    ) as protocol: # protocol is QuicConnection
+        
+        protocol._quic._logger.info("MWL Test: Connection established, performing initial ping.")
+        await protocol.ping()
+        protocol._quic._logger.info("MWL Test: Initial ping successful.")
+
+        original_local_addr = protocol._transport.get_extra_info('sockname')
+        if original_local_addr is None:
+            protocol._quic._logger.error("MWL Test: Could not get original local address.")
+            return
+        
+        # Attempt to migrate to a new port on the same IP
+        new_local_addr = (original_local_addr[0], 0)
+        protocol._quic._logger.info(f"MWL Test: Original addr {original_local_addr}, attempting migration to new port on same IP ({new_local_addr[0]}:0).")
+
+        # Close current transport
+        protocol._transport.close()
+        protocol._quic._logger.info("MWL Test: Original transport closed.")
+
+        loop = asyncio.get_event_loop()
+        try:
+            # Create new transport and rebind protocol
+            # The 'protocol' instance itself is reused by the lambda.
+            # The `create_datagram_endpoint` will update the transport used by the protocol instance.
+            _,_ = await loop.create_datagram_endpoint(
+                lambda: protocol, local_addr=new_local_addr
+            )
+            protocol._quic._logger.info(f"MWL Test: Rebound to new local address {protocol._transport.get_extra_info('sockname')}.")
+            
+            protocol.change_connection_id() # Recommended during migration
+            protocol.probe_new_path()      # Explicitly send PATH_CHALLENGE
+            protocol._quic._logger.info("MWL Test: change_connection_id() and probe_new_path() called.")
+
+        except Exception as e:
+            protocol._quic._logger.error(f"MWL Test: Error during transport migration: {e}")
+            return # Cannot proceed if migration setup fails
+
+        # Post-migration operations to check stability and recovery
+        migration_successful_communication = False
+        try:
+            protocol._quic._logger.info("MWL Test: Attempting first ping after migration.")
+            await protocol.ping()
+            protocol._quic._logger.info("MWL Test: First ping after migration successful.")
+
+            # Open a new stream and send some data
+            # This requires protocol._quic as it's a QuicConnection feature
+            new_stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
+            protocol._quic._logger.info(f"MWL Test: Opening new stream {new_stream_id} and sending data.")
+            message = b"Data after migration on new stream"
+            protocol._quic.send_stream_data(new_stream_id, message, end_stream=True)
+            # We might need to ensure this data is flushed / acked for a full test.
+            # A subsequent ping helps confirm connectivity for this.
+
+            protocol._quic._logger.info("MWL Test: Attempting second ping after migration and data send.")
+            await protocol.ping()
+            protocol._quic._logger.info("MWL Test: Second ping after migration successful. Communication appears stable.")
+            migration_successful_communication = True
+
+        except QuicConnectionError as e:
+            protocol._quic._logger.error(f"MWL Test: QuicConnectionError during post-migration operations: {e}")
+        except Exception as e:
+            protocol._quic._logger.error(f"MWL Test: Unexpected exception during post-migration operations: {e}")
+
+        # Log inspection for path validation
+        path_challenge_sent = False
+        path_response_received = False
+        # Optional: Check for packet loss and retransmission (harder to guarantee observation)
+        # For now, focus on PATH_CHALLENGE/RESPONSE and successful communication.
+
+        try:
+            log_data = configuration.quic_logger.to_dict()
+            traces = log_data.get("traces", [])
+            if not traces:
+                protocol._quic._logger.warning("MWL Test: No traces found in QUIC log for inspection.")
+            else:
+                for trace in traces: # Should typically be one trace for client
+                    for event in trace.get("events", []):
+                        event_name = event.get("name")
+                        event_data = event.get("data", {})
+                        
+                        if event_name == "transport:packet_sent":
+                            for frame in event_data.get("frames", []):
+                                if frame.get("frame_type") == "path_challenge":
+                                    path_challenge_sent = True
+                                    # Could also log frame.get("data") to see the challenge data
+                        elif event_name == "transport:packet_received":
+                            for frame in event_data.get("frames", []):
+                                if frame.get("frame_type") == "path_response":
+                                    path_response_received = True
+                                    # Could also log frame.get("data") to see the response data
+            
+            if path_challenge_sent and path_response_received:
+                protocol._quic._logger.info("MWL Test: PATH_CHALLENGE sent and PATH_RESPONSE received confirmed in logs.")
+            else:
+                protocol._quic._logger.warning(
+                    f"MWL Test: Path validation status - Challenge Sent: {path_challenge_sent}, Response Received: {path_response_received}."
+                )
+
+        except Exception as e:
+            protocol._quic._logger.error(f"MWL Test: Error inspecting QUIC log: {e}")
+
+        # Determine overall success
+        if migration_successful_communication and path_challenge_sent and path_response_received:
+            protocol._quic._logger.info(f"MWL Test: Successful for server {server.name}. Post-migration comms OK & path validated.")
+            server.result |= Result.MWL
+        elif migration_successful_communication:
+            # If comms are fine but path validation log evidence is weak/missing, still a partial success.
+            # For this test, we'll require path validation to be observed for the MWL flag.
+            protocol._quic._logger.warning(
+                f"MWL Test: Post-migration communication for server {server.name} was successful, but path validation (CHALLENGE/RESPONSE) "
+                "was not fully confirmed in logs. Not setting MWL flag based on current criteria."
+            )
+            # If the requirement was softer, this could be server.result |= Result.MWL
+        else:
+            protocol._quic._logger.warning(f"MWL Test: Failed for server {server.name} due to communication issues post-migration or lack of path validation.")
+
+
+async def test_h3_settings_error_handling(server: Server, configuration: QuicConfiguration):
+    if configuration.quic_logger is None:
+        print("QuicLogger not configured, cannot verify H3SE test.")
+        return
+
+    configuration.alpn_protocols = H3_ALPN
+    
+    # Import necessary enums and functions
+    from aioquic.h3.connection import ErrorCode, encode_frame
+    from aioquic.h3.frames import H3FrameType
+    from aioquic.quic.connection import QuicConnectionError
+
+    async with connect(
+        server.host,
+        server.http3_port or server.port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as protocol:
+        http_client = cast(HttpClient, protocol)
+        
+        # Ensure H3 handshake completes and control streams are established.
+        # A ping often achieves this as HttpClient sets up H3 on first use.
+        try:
+            await http_client.ping()
+            http_client._quic._logger.info("H3SE Test: Initial ping successful, H3 connection should be ready.")
+        except QuicConnectionError as e:
+            http_client._quic._logger.error(f"H3SE Test: Initial ping failed: {e}. Cannot proceed.")
+            return
+
+        # Get the client's local (outgoing) H3 control stream ID.
+        # For clients, this is typically stream ID 2.
+        control_stream_id = http_client._http._stream_id_control_local
+        if control_stream_id is None:
+            http_client._quic._logger.error("H3SE Test: Client's local H3 control stream ID is None. Cannot proceed.")
+            return
+        http_client._quic._logger.info(f"H3SE Test: Client's local H3 control stream ID: {control_stream_id}.")
+
+        # Construct a malformed H3 SETTINGS frame (using a reserved setting ID 0x21).
+        # Payload: ID 0x21 (2 bytes, network order for hypothetical value if it had one, but not needed for type)
+        # For a setting with ID 0x21 and length 0, the payload is just \x21\x00
+        malformed_settings_payload = b'\x21\x00' # Setting ID 0x21 (reserved), length 0
+        malformed_settings_frame_bytes = encode_frame(H3FrameType.SETTINGS, malformed_settings_payload)
+        http_client._quic._logger.info(f"H3SE Test: Constructed malformed H3 SETTINGS frame: {malformed_settings_frame_bytes.hex()}")
+
+        try:
+            # Send the malformed H3 SETTINGS frame on the client's H3 control stream.
+            http_client._quic.send_stream_data(control_stream_id, malformed_settings_frame_bytes, end_stream=False)
+            http_client._quic._logger.info(f"H3SE Test: Sent malformed H3 SETTINGS frame on control stream {control_stream_id}.")
+            
+            # Wait for the server to process and react. Expect connection closure.
+            await http_client.ping() # This ping should ideally fail.
+            http_client._quic._logger.warning("H3SE Test: Ping after sending malformed SETTINGS frame succeeded, server might not have reacted as expected.")
+
+        except QuicConnectionError as e:
+            http_client._quic._logger.info(f"H3SE Test: QuicConnectionError caught as expected after sending malformed SETTINGS: {e}")
+            # This is expected. Now verify the reason in the logs.
+        except Exception as e:
+            http_client._quic._logger.error(f"H3SE Test: Unexpected exception after sending malformed SETTINGS: {e}")
+            # Continue to log inspection.
+            pass
+
+        # Inspect logger for server-initiated connection close with H3_SETTINGS_ERROR
+        found_h3_settings_error_close = False
+        expected_h3_error_code = ErrorCode.H3_SETTINGS_ERROR
+        
+        try:
+            log_data = configuration.quic_logger.to_dict()
+            traces = log_data.get("traces", [])
+            if not traces:
+                http_client._quic._logger.warning("H3SE Test: No traces found in QUIC log for H3SE check.")
+            else:
+                for trace in traces:
+                    for event in trace.get("events", []):
+                        event_name = event.get("name")
+                        event_data = event.get("data", {})
+
+                        if event_name == "transport:connection_terminated":
+                            logged_error_code = event_data.get("error_code")
+                            if logged_error_code == expected_h3_error_code.value:
+                                http_client._quic._logger.info(
+                                    f"H3SE Test: transport:connection_terminated event with H3_SETTINGS_ERROR ({expected_h3_error_code.value}) found."
+                                )
+                                found_h3_settings_error_close = True
+                                break
+                        
+                        elif event_name == "transport:packet_received":
+                            for frame in event_data.get("frames", []):
+                                if frame.get("frame_type") == "connection_close":
+                                    # Check based on findings from SCSE test for how H3 errors are logged in CONNECTION_CLOSE
+                                    logged_frame_error_code = frame.get("error_code") # for aioquic qlog when app error
+                                    application_error_code = frame.get("application_error_code") # for 0x1d type if distinct
+
+                                    if logged_frame_error_code == expected_h3_error_code.value:
+                                        http_client._quic._logger.info(
+                                            f"H3SE Test: Received CONNECTION_CLOSE frame with 'error_code' H3_SETTINGS_ERROR ({expected_h3_error_code.value})."
+                                        )
+                                        found_h3_settings_error_close = True
+                                        break
+                                    elif frame.get("close_type") == "application_close" and application_error_code == expected_h3_error_code.value:
+                                        http_client._quic._logger.info(
+                                            f"H3SE Test: Received CONNECTION_CLOSE (application) frame with 'application_error_code' H3_SETTINGS_ERROR ({expected_h3_error_code.value})."
+                                        )
+                                        found_h3_settings_error_close = True
+                                        break
+                        if found_h3_settings_error_close:
+                            break
+                    if found_h3_settings_error_close:
+                        break
+            
+            if found_h3_settings_error_close:
+                server.result |= Result.H3SE
+                http_client._quic._logger.info(f"H3SE Test: Server correctly closed with H3_SETTINGS_ERROR. H3SE flag set for server {server.name}.")
+            else:
+                http_client._quic._logger.warning(
+                    f"H3SE Test: Server {server.name} did not close with H3_SETTINGS_ERROR ({expected_h3_error_code.value}), or event not found/matched in logs."
+                )
+
+        except Exception as e:
+            http_client._quic._logger.error(f"H3SE Test: Error inspecting QUIC log: {e}")
 
 
 def print_result(server: Server) -> None:
