@@ -23,7 +23,6 @@ from aioquic.h3.connection import H3_ALPN, H3Connection,ErrorCode
 from aioquic.h3.events import DataReceived, HeadersReceived, PushPromiseReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.logger import QuicFileLogger, QuicLogger
-from aioquic.quic.frames import RetireConnectionIdFrame, PathChallengeFrame, PathResponseFrame
 
 
 class Result(Flag):
@@ -45,9 +44,6 @@ class Result(Flag):
     L = 0x004000
     T = 0x008000
 
-    three = 0x010000
-    d = 0x020000
-    p = 0x040000
     MSL = 0x080000
     SDB = 0x100000
     SS = 0x200000
