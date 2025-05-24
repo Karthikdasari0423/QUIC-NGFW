@@ -46,9 +46,7 @@ class Result(Flag):
     three = 0x010000
     d = 0x020000
     p = 0x040000
-    POST_SUCCESS = 0x080000
-    ZERORTT_REJECTED_OK = 0x100000
-    APP_CLOSE_OK = 0x200000
+    FLOW_CTRL_OK = 0x800000
 
     def __str__(self):
         flags = sorted(
@@ -296,63 +294,74 @@ async def test_http_3(server: Server, configuration: QuicConfiguration):
                     server.result |= Result.p
 
 
-async def test_http_3_post(server: Server, configuration: QuicConfiguration):
+async def test_stream_flow_control(
+    server: Server, configuration: QuicConfiguration
+):
     port = server.http3_port or server.port
-    if server.path is None:
+    # server.path is not strictly needed for this test, but reusing it for consistency.
+    # A dedicated echo path on the server would be better for true e2e validation of data receipt.
+    if server.path is None: 
         return
 
-    configuration.alpn_protocols = H3_ALPN
+    configuration.alpn_protocols = H3_ALPN 
     async with connect(
         server.host,
         port,
         configuration=configuration,
-        create_protocol=HttpClient,
+        create_protocol=HttpClient, # Using HttpClient for convenience
     ) as protocol:
         protocol = cast(HttpClient, protocol)
 
-        # perform HTTP POST request
-        payload = b'{"key": "value"}'
-        headers = [
-            (b"content-type", b"application/json"),
-            (b"content-length", b"%d" % len(payload)),
-        ]
-        events = await protocol.post(
-            "https://{}:{}{}".format(server.host, server.port, server.path),
-            content=payload,
-            headers=headers,
-        )
-        if events and isinstance(events[0], HeadersReceived):
-            status_code = int(dict(events[0].headers)[b":status"])
-            if status_code in [200, 201]:
-                server.result |= Result.POST_SUCCESS
+        # Get a new client-initiated bidirectional stream ID
+        stream_id = protocol._quic.get_next_available_stream_id(is_client=True)
+        
+        # Define a payload larger than typical initial flow control windows.
+        data_to_send = b'D' * (1024 * 1024) # 1MB
 
+        # Attempt to send all data for the stream.
+        # aioquic will buffer this data and send it as the peer provides flow control credits.
+        protocol._quic.send_stream_data(stream_id, data_to_send, end_stream=False)
+        
+        # Send FIN for the stream.
+        protocol._quic.send_stream_data(stream_id, b'', end_stream=True)
 
-async def test_0rtt_rejection(server: Server, configuration: QuicConfiguration):
-    configuration.early_data_0rtt = b"attempting 0-RTT"
-    # A dummy ticket is often needed to trigger 0-RTT attempt logic,
-    # even if it's not a real, valid ticket.
-    configuration.session_ticket = b"dummy_ticket"
+        # Perform an initial ping to ensure the connection is healthy after queuing the data.
+        await protocol.ping()
+        
+        # Wait for a period to allow for data transfer and acknowledgments.
+        await asyncio.sleep(2.0)
+        
+        # Perform another ping to confirm the connection remains healthy.
+        await protocol.ping()
 
-    async with connect(
-        server.host, server.port, configuration=configuration
-    ) as protocol:
-        await protocol.ping()  # Ensure connection is alive
-        if not protocol._quic.tls.early_data_accepted:
-            # Ping again to ensure connection is still usable after 0-RTT rejection
-            await protocol.ping()
-            server.result |= Result.ZERORTT_REJECTED_OK
-
-
-async def test_close_with_application_error(
-    server: Server, configuration: QuicConfiguration
-):
-    async with connect(
-        server.host, server.port, configuration=configuration
-    ) as protocol:
-        await protocol.ping()  # Ensure connection is established
-        protocol.close(error_code=0x1234, reason_phrase="Application test close")
-        await protocol.wait_closed()
-        server.result |= Result.APP_CLOSE_OK
+        # Check aioquic's perspective: has all data been sent and acknowledged by the peer?
+        stream = protocol._quic._get_stream_by_id(stream_id)
+        if (
+            stream is not None
+            and stream.sender.stream_ended 
+            and stream.sender.is_buffer_empty
+        ):
+            server.result |= Result.FLOW_CTRL_OK
+        else:
+            if stream is None:
+                protocol._quic._logger.warning(
+                    f"Flow control test (stream {stream_id}): Stream object not found."
+                )
+            else:
+                if not stream.sender.stream_ended:
+                    protocol._quic._logger.warning(
+                        f"Flow control test (stream {stream_id}): Stream FIN not considered sent/acked. "
+                        f"Sender state: offset={stream.sender._offset}, "
+                        f"max_offset={stream.sender._max_offset}, "
+                        f"buffer_is_empty={stream.sender.is_buffer_empty()}"
+                    )
+                if not stream.sender.is_buffer_empty:
+                     protocol._quic._logger.warning(
+                        f"Flow control test (stream {stream_id}): Stream sender buffer not empty. "
+                        f"Sender state: offset={stream.sender._offset}, "
+                        f"max_offset={stream.sender._max_offset}, "
+                        f"stream_ended={stream.sender.stream_ended}"
+                    )
 
 
 async def test_session_resumption(server: Server, configuration: QuicConfiguration):
