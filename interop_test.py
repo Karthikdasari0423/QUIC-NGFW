@@ -539,7 +539,7 @@ async def test_handshake_done_received(
                                 break
                         if handshake_done_frame_found:
                             break
-        except Exception e:
+        except Exception as e:
             logger.error(f"Error processing QLOG for HANDSHAKE_DONE detection: {e}")
 
         if handshake_done_frame_found:
