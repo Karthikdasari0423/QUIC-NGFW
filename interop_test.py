@@ -7,6 +7,7 @@
 import argparse
 import asyncio
 import logging
+import os
 import ssl
 import time
 from dataclasses import dataclass, field
@@ -21,7 +22,7 @@ from aioquic.h0.connection import H0_ALPN
 from aioquic.h3.connection import H3_ALPN, H3Connection,ErrorCode
 from aioquic.h3.events import DataReceived, HeadersReceived, PushPromiseReceived
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.frames import RetireConnectionIdFrame
+from aioquic.quic.frames import RetireConnectionIdFrame, PathChallengeFrame, PathResponseFrame
 from aioquic.quic.logger import QuicFileLogger, QuicLogger
 
 
@@ -48,6 +49,9 @@ class Result(Flag):
     d = 0x020000
     p = 0x040000
     CID_RETIREMENT_OK = 0x4000000
+    PATH_VALIDATION_INITIATED_OK = 0x8000000
+    MAX_DATA_UPDATE_OK = 0x10000000
+    HANDSHAKE_DONE_RECEIVED_OK = 0x20000000
 
     def __str__(self):
         flags = sorted(
@@ -412,6 +416,252 @@ async def test_cid_retirement_interaction(
         # Final connection health check
         await protocol.ping()
         logger.info("CID retirement interaction test finished. Final ping check.")
+
+
+async def test_client_path_validation_response(
+    server: Server, configuration: QuicConfiguration
+):
+    port = server.http3_port or server.port
+    if server.path is None: # Not strictly for path val, but http client needs it
+        return
+
+    quic_logger = QuicLogger()
+    configuration.quic_logger = quic_logger
+    configuration.alpn_protocols = H3_ALPN 
+
+    async with connect(
+        server.host,
+        port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as protocol:
+        protocol = cast(HttpClient, protocol)
+        logger = protocol._quic._logger
+
+        # Wait for the handshake to be confirmed so 1-RTT keys are available
+        await protocol._quic.wait_handshake_confirmed()
+        logger.info("Handshake confirmed. Proceeding with PATH_CHALLENGE.")
+
+        challenge_data = os.urandom(8)
+        logger.info(f"Sending PATH_CHALLENGE with data: {challenge_data.hex()}")
+        
+        protocol._quic._send_frame(PathChallengeFrame(data=challenge_data))
+        
+        # Send a PING to help ensure the PATH_CHALLENGE is flushed quickly
+        await protocol.ping() 
+        logger.info("PATH_CHALLENGE sent, ping also sent to flush.")
+
+        # Wait for the server to respond
+        await asyncio.sleep(2.0) # Allow time for server processing and network RTT
+
+        path_response_received_correctly = False
+        try:
+            log_dict = quic_logger.to_dict()
+            if log_dict and "traces" in log_dict and log_dict["traces"]:
+                for event in log_dict["traces"][0].get("events", []):
+                    if event.get("name") == "transport:frame_received":
+                        for frame_data in event.get("data", {}).get("frames", []):
+                            if frame_data.get("frame_type") == "path_response":
+                                received_payload_hex = frame_data.get("data")
+                                if received_payload_hex:
+                                    received_payload_bytes = bytes.fromhex(received_payload_hex)
+                                    logger.info(
+                                        f"QLOG: PATH_RESPONSE frame received with data: {received_payload_bytes.hex()}"
+                                    )
+                                    if received_payload_bytes == challenge_data:
+                                        path_response_received_correctly = True
+                                        logger.info("PATH_RESPONSE data matches PATH_CHALLENGE data.")
+                                        break 
+                                    else:
+                                        logger.warning(
+                                            f"PATH_RESPONSE data mismatch. Expected: {challenge_data.hex()}, Got: {received_payload_bytes.hex()}"
+                                        )
+                                else:
+                                    logger.warning("PATH_RESPONSE frame in QLOG missing 'data' field.")
+                        if path_response_received_correctly:
+                            break 
+        except Exception as e:
+            logger.error(f"Error processing QLOG for PATH_RESPONSE: {e}")
+
+        if path_response_received_correctly:
+            server.result |= Result.PATH_VALIDATION_INITIATED_OK
+            logger.info("Path validation response test successful.")
+        else:
+            logger.warning("Matching PATH_RESPONSE was not found in QLOG.")
+
+        # Final health check
+        await protocol.ping()
+        logger.info("Client path validation test finished.")
+
+
+async def test_max_data_frame_handling(
+    server: Server, configuration: QuicConfiguration
+):
+    port = server.http3_port or server.port
+    if server.path is None: # Path needed for POST requests
+        return
+
+    # quic_logger = QuicLogger() # Not strictly needed for this test as we check internal state
+    # configuration.quic_logger = quic_logger
+    configuration.alpn_protocols = H3_ALPN 
+
+    async with connect(
+        server.host,
+        port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as protocol:
+        protocol = cast(HttpClient, protocol)
+        logger = protocol._quic._logger
+
+        await protocol._quic.wait_handshake_confirmed()
+        logger.info("Handshake confirmed for MAX_DATA test.")
+
+        initial_max_data = protocol._quic.peer_params.initial_max_data
+        logger.info(f"Initial peer initial_max_data: {initial_max_data}")
+
+        min_data_to_send = 1024  # 1KB
+        if initial_max_data == 0:
+            logger.warning("Peer's initial_max_data is 0. This test may not be effective. Sending minimal data.")
+            data_to_send_size = min_data_to_send 
+        elif initial_max_data < min_data_to_send * 2: # If it's too small to trigger ~85% rule effectively
+             logger.warning(f"Peer's initial_max_data ({initial_max_data}) is very small. Sending a small chunk.")
+             data_to_send_size = int(initial_max_data * 0.5) if initial_max_data > min_data_to_send else min_data_to_send
+             if data_to_send_size == 0 and initial_max_data > 0 : data_to_send_size = initial_max_data # send all if it's tiny but non-zero
+             elif data_to_send_size == 0 : data_to_send_size = min_data_to_send # fallback
+        else:
+            data_to_send_size = int(initial_max_data * 0.85)
+            if data_to_send_size == 0: # Ensure we send something if 85% rounds down to 0
+                data_to_send_size = min_data_to_send if initial_max_data > min_data_to_send else initial_max_data
+
+
+        logger.info(f"Attempting to send {data_to_send_size} bytes of data to consume flow control window.")
+        
+        try:
+            # Using a POST request to send data. This will use one stream.
+            # HttpClient handles stream creation and sending data.
+            initial_post_path = f"https://{server.host}:{port}{server.path}max_data_initial_send"
+            response_events_initial = await protocol.post(
+                initial_post_path,
+                content=b'D' * data_to_send_size,
+                headers=[(b"content-length", b"%d" % data_to_send_size)]
+            )
+            if not response_events_initial or not isinstance(response_events_initial[0], HeadersReceived):
+                logger.warning(f"Initial POST request for MAX_DATA test did not get valid response headers. Path: {initial_post_path}")
+                # Test might still proceed if data was sent, but this is not ideal.
+            else:
+                 logger.info(f"Initial POST request to {initial_post_path} completed (status: {dict(response_events_initial[0].headers).get(b':status')}).")
+
+        except Exception as e:
+            logger.error(f"Error during initial data send for MAX_DATA test: {e}")
+            await protocol.ping() # Check if connection is still alive
+            return # Cannot proceed if initial send fails
+
+        limit_before_wait = protocol._quic.flow_control._remote_max_data
+        logger.info(f"Connection flow control limit from peer (before wait): {limit_before_wait}")
+
+        logger.info("Waiting for 3 seconds for server to potentially send MAX_DATA frame...")
+        await asyncio.sleep(3.0)
+
+        new_max_data_after_wait = protocol._quic.flow_control._remote_max_data
+        logger.info(f"Connection flow control limit from peer (after wait): {new_max_data_after_wait}")
+
+        if new_max_data_after_wait > limit_before_wait:
+            logger.info(
+                f"MAX_DATA update detected. Limit increased from {limit_before_wait} to {new_max_data_after_wait}."
+            )
+            
+            additional_data_size = 10 * 1024 # 10KB
+            logger.info(f"Attempting to send an additional {additional_data_size} bytes of data.")
+            try:
+                extra_post_path = f"https://{server.host}:{port}{server.path}max_data_extra_send"
+                response_events_extra = await protocol.post(
+                    extra_post_path,
+                    content=b'M' * additional_data_size,
+                    headers=[(b"content-length", b"%d" % additional_data_size)]
+                )
+                if response_events_extra and isinstance(response_events_extra[0], HeadersReceived):
+                    logger.info(
+                        f"Successfully sent additional data after MAX_DATA update. "
+                        f"Extra POST to {extra_post_path} status: {dict(response_events_extra[0].headers).get(b':status')}."
+                    )
+                    server.result |= Result.MAX_DATA_UPDATE_OK
+                else:
+                    logger.warning(f"Additional POST for MAX_DATA test did not get valid response headers. Path: {extra_post_path}")
+
+            except Exception as e:
+                logger.error(f"Error sending additional data after MAX_DATA update: {e}")
+        else:
+            logger.warning(
+                f"Connection flow control limit did not increase. "
+                f"Before wait: {limit_before_wait}, After wait: {new_max_data_after_wait}. "
+                "Server might not have sent MAX_DATA or it was not processed."
+            )
+        
+        await protocol.ping()
+        logger.info("MAX_DATA frame handling test finished.")
+
+
+async def test_handshake_done_received(
+    server: Server, configuration: QuicConfiguration
+):
+    port = server.http3_port or server.port
+    # server.path is not strictly needed for this test, but HttpClient requires a path for GET/POST.
+    # We'll use a simple GET request to ensure the connection proceeds.
+    if server.path is None:
+        return
+
+    quic_logger = QuicLogger()
+    configuration.quic_logger = quic_logger
+    configuration.alpn_protocols = H3_ALPN 
+
+    async with connect(
+        server.host,
+        port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as protocol:
+        protocol = cast(HttpClient, protocol)
+        logger = protocol._quic._logger
+
+        # Ensure handshake is confirmed from client's perspective
+        await protocol._quic.wait_handshake_confirmed()
+        logger.info("Handshake confirmed by client.")
+        
+        # Perform a simple GET request to ensure data exchange happens and server has opportunity
+        # to send HANDSHAKE_DONE if it hasn't already by the time wait_handshake_confirmed() returns.
+        # Some servers might send HANDSHAKE_DONE very promptly.
+        try:
+            await protocol.get(f"https://{server.host}:{port}{server.path}handshake_done_check")
+        except Exception as e:
+            logger.warning(f"GET request during HANDSHAKE_DONE check failed: {e}")
+            # Proceed to check QLOG anyway, as HANDSHAKE_DONE might have been processed.
+
+        handshake_done_frame_found = False
+        try:
+            log_dict = quic_logger.to_dict()
+            if log_dict and "traces" in log_dict and log_dict["traces"]:
+                for event in log_dict["traces"][0].get("events", []):
+                    if event.get("name") == "transport:frame_received":
+                        for frame_data in event.get("data", {}).get("frames", []):
+                            if frame_data.get("frame_type") == "handshake_done":
+                                handshake_done_frame_found = True
+                                logger.info("HANDSHAKE_DONE frame successfully detected in QLOG from server.")
+                                break
+                        if handshake_done_frame_found:
+                            break
+        except Exception e:
+            logger.error(f"Error processing QLOG for HANDSHAKE_DONE detection: {e}")
+
+        if handshake_done_frame_found:
+            server.result |= Result.HANDSHAKE_DONE_RECEIVED_OK
+        else:
+            logger.warning("HANDSHAKE_DONE frame not detected in QLOG from server.")
+            # Note: A server is only REQUIRED to send HANDSHAKE_DONE if it's a TLS 1.3 server
+            # and the handshake completes successfully. This test assumes it should be sent.
+
+        await protocol.ping() # Final health check
+        logger.info("HANDSHAKE_DONE reception test finished.")
 
 
 async def test_session_resumption(server: Server, configuration: QuicConfiguration):
