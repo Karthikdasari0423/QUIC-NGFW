@@ -21,6 +21,7 @@ from aioquic.h0.connection import H0_ALPN
 from aioquic.h3.connection import H3_ALPN, H3Connection,ErrorCode
 from aioquic.h3.events import DataReceived, HeadersReceived, PushPromiseReceived
 from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.frames import RetireConnectionIdFrame
 from aioquic.quic.logger import QuicFileLogger, QuicLogger
 
 
@@ -46,7 +47,7 @@ class Result(Flag):
     three = 0x010000
     d = 0x020000
     p = 0x040000
-    FLOW_CTRL_OK = 0x800000
+    CID_RETIREMENT_OK = 0x4000000
 
     def __str__(self):
         flags = sorted(
@@ -294,74 +295,123 @@ async def test_http_3(server: Server, configuration: QuicConfiguration):
                     server.result |= Result.p
 
 
-async def test_stream_flow_control(
+async def test_cid_retirement_interaction(
     server: Server, configuration: QuicConfiguration
 ):
     port = server.http3_port or server.port
-    # server.path is not strictly needed for this test, but reusing it for consistency.
-    # A dedicated echo path on the server would be better for true e2e validation of data receipt.
-    if server.path is None: 
+    if server.path is None: # Path needed for HttpClient GET
         return
 
-    configuration.alpn_protocols = H3_ALPN 
+    quic_logger = QuicLogger()
+    configuration.quic_logger = quic_logger
+    configuration.alpn_protocols = H3_ALPN # Using H3 for HttpClient convenience
+
     async with connect(
         server.host,
         port,
         configuration=configuration,
-        create_protocol=HttpClient, # Using HttpClient for convenience
+        create_protocol=HttpClient,
     ) as protocol:
         protocol = cast(HttpClient, protocol)
+        logger = protocol._quic._logger
 
-        # Get a new client-initiated bidirectional stream ID
-        stream_id = protocol._quic.get_next_available_stream_id(is_client=True)
+        # Identify the server's initial CID (sequence number 0)
+        cid_to_retire_seq = 0
+        server_initial_cid_obj = None
+        for seq, cid_obj in protocol._quic.peer_cids.items():
+            if seq == cid_to_retire_seq:
+                server_initial_cid_obj = cid_obj
+                break
         
-        # Define a payload larger than typical initial flow control windows.
-        data_to_send = b'D' * (1024 * 1024) # 1MB
+        if server_initial_cid_obj is None:
+            logger.warning(
+                f"Server's initial CID (sequence {cid_to_retire_seq}) not found in peer_cids. "
+                "Cannot proceed with retirement test."
+            )
+            await protocol.ping() # Still check connection health
+            return
 
-        # Attempt to send all data for the stream.
-        # aioquic will buffer this data and send it as the peer provides flow control credits.
-        protocol._quic.send_stream_data(stream_id, data_to_send, end_stream=False)
-        
-        # Send FIN for the stream.
-        protocol._quic.send_stream_data(stream_id, b'', end_stream=True)
+        logger.info(
+            f"Target for retirement: Server CID {server_initial_cid_obj.cid.hex()} (seq: {cid_to_retire_seq}). "
+            f"Currently used dest CID by client: {protocol._quic._remote_cid.hex()}"
+        )
 
-        # Perform an initial ping to ensure the connection is healthy after queuing the data.
-        await protocol.ping()
+        # Store known peer CID sequence numbers before retirement
+        # Filter out any already retired CIDs if any (should not be the case for seq 0 initially)
+        known_peer_cid_seqs_before_retire = {
+            c.sequence_number for c in protocol._quic.peer_cids.values() if c.retired_time is None
+        }
+        logger.info(f"Active peer CID sequences before retirement: {known_peer_cid_seqs_before_retire}")
         
-        # Wait for a period to allow for data transfer and acknowledgments.
+        time_retire_sent_ns = time.time_ns() # Use nanoseconds for better precision
+        protocol._quic._send_frame(RetireConnectionIdFrame(sequence_number=cid_to_retire_seq))
+        logger.info(f"RETIRE_CONNECTION_ID for seq {cid_to_retire_seq} sent at time_ns {time_retire_sent_ns}.")
+
+        # Wait for the server to process the retirement and potentially issue a new CID
         await asyncio.sleep(2.0)
-        
-        # Perform another ping to confirm the connection remains healthy.
-        await protocol.ping()
 
-        # Check aioquic's perspective: has all data been sent and acknowledged by the peer?
-        stream = protocol._quic._get_stream_by_id(stream_id)
-        if (
-            stream is not None
-            and stream.sender.stream_ended 
-            and stream.sender.is_buffer_empty
-        ):
-            server.result |= Result.FLOW_CTRL_OK
+        new_cid_frame_found_in_qlog = False
+        newly_learned_cid_seq = -1
+
+        try:
+            log_dict = quic_logger.to_dict()
+            if log_dict and "traces" in log_dict and log_dict["traces"]:
+                # QLOG time is typically in microseconds relative to trace start, or milliseconds absolute
+                # Convert time_retire_sent_ns to the QLOG's relative time if necessary,
+                # or compare absolute times if QLOG uses them. AIOQUIC QLogger uses relative time in ms.
+                # For simplicity, we'll just check all NEW_CONNECTION_ID frames after sending.
+                for event in log_dict["traces"][0].get("events", []):
+                    # Assuming event time is relative to trace start in ms for aioquic's QuicLogger
+                    # This time comparison is tricky with QLOG. A simpler check is just for any new CID.
+                    if event.get("name") == "transport:frame_received": # Check frames _received_ by client
+                        for frame_data in event.get("data", {}).get("frames", []):
+                            if frame_data.get("frame_type") == "new_connection_id":
+                                new_seq = frame_data.get("sequence_number")
+                                retire_prior_to = frame_data.get("retire_prior_to", -1) # Default if not present
+                                
+                                logger.info(
+                                    f"QLOG: Detected NEW_CONNECTION_ID frame from server: seq={new_seq}, "
+                                    f"retire_prior_to={retire_prior_to}. CID: {frame_data.get('connection_id')}"
+                                )
+                                # Check if this NEW_CONNECTION_ID is genuinely new and not one we knew before sending RETIRE
+                                if new_seq is not None and new_seq not in known_peer_cid_seqs_before_retire:
+                                    new_cid_frame_found_in_qlog = True
+                                    newly_learned_cid_seq = max(newly_learned_cid_seq, new_seq)
+                                    # No break here, log all new CIDs if multiple are sent
+        except Exception as e:
+            logger.error(f"Error processing QLOG for NEW_CONNECTION_ID: {e}")
+
+        # Check internal state of the retired CID
+        cid_obj_after_retire_attempt = protocol._quic.peer_cids.get(cid_to_retire_seq)
+        is_cid_marked_retired = False
+        if cid_obj_after_retire_attempt and cid_obj_after_retire_attempt.retired_time is not None:
+            logger.info(f"Internal check: CID seq {cid_to_retire_seq} is marked as retired.")
+            is_cid_marked_retired = True
+        elif not cid_obj_after_retire_attempt : # If it was removed
+             logger.info(f"Internal check: CID seq {cid_to_retire_seq} was removed from peer_cids list.")
+             is_cid_marked_retired = True # Also acceptable
         else:
-            if stream is None:
-                protocol._quic._logger.warning(
-                    f"Flow control test (stream {stream_id}): Stream object not found."
-                )
-            else:
-                if not stream.sender.stream_ended:
-                    protocol._quic._logger.warning(
-                        f"Flow control test (stream {stream_id}): Stream FIN not considered sent/acked. "
-                        f"Sender state: offset={stream.sender._offset}, "
-                        f"max_offset={stream.sender._max_offset}, "
-                        f"buffer_is_empty={stream.sender.is_buffer_empty()}"
-                    )
-                if not stream.sender.is_buffer_empty:
-                     protocol._quic._logger.warning(
-                        f"Flow control test (stream {stream_id}): Stream sender buffer not empty. "
-                        f"Sender state: offset={stream.sender._offset}, "
-                        f"max_offset={stream.sender._max_offset}, "
-                        f"stream_ended={stream.sender.stream_ended}"
-                    )
+            logger.warning(f"Internal check: CID seq {cid_to_retire_seq} still present and not marked retired.")
+            if cid_obj_after_retire_attempt:
+                 logger.warning(f"CID {cid_to_retire_seq} details: {cid_obj_after_retire_attempt}")
+
+
+        if new_cid_frame_found_in_qlog and is_cid_marked_retired:
+            logger.info(
+                f"Success: Server sent a new CID (highest new seq: {newly_learned_cid_seq}) "
+                f"and client correctly processed retirement of CID seq {cid_to_retire_seq}."
+            )
+            server.result |= Result.CID_RETIREMENT_OK
+        else:
+            logger.warning(
+                f"CID retirement test conditions not fully met. "
+                f"New CID in QLOG: {new_cid_frame_found_in_qlog} (new seq: {newly_learned_cid_seq}). "
+                f"Old CID (seq {cid_to_retire_seq}) retired internally: {is_cid_marked_retired}."
+            )
+            
+        # Final connection health check
+        await protocol.ping()
+        logger.info("CID retirement interaction test finished. Final ping check.")
 
 
 async def test_session_resumption(server: Server, configuration: QuicConfiguration):
