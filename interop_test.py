@@ -76,6 +76,9 @@ class Result(Flag):
     ZRF = 0x100000000   # 0RTT Rejection Fallback (was 0x4000000)
     QTC = 0x200000000   # QPACK Table Capacity (was 0x8000000)
     MSU = 0x400000000   # Max Streams Update usage by client (was 0x10000000)
+    H3MPI = 0x800000000 # HTTP/3 Max Push ID handling
+    ZAMF = 0x1000000000 # 0-RTT ALPN Mismatch Fallback
+    H3DSF = 0x2000000000 # HTTP/3 Duplicate SETTINGS Frame
 
     # Define the character representation for each flag
     # This will be used in __str__ for sorting and display
@@ -88,7 +91,7 @@ class Result(Flag):
         CID_RETIREMENT_OK: "I", PATH_VALIDATION_INITIATED_OK: "Y",
         MAX_DATA_UPDATE_OK: "X", HANDSHAKE_DONE_RECEIVED_OK: "K",
         MVA: "N", H3G: "G",
-        ZRF: "z", QTC: "q", MSU: "u",
+        ZRF: "z", QTC: "q", MSU: "u", H3MPI: "i", ZAMF: "f", H3DSF: "2", # '2' for duplicate
     }
 
     def __str__(self):
@@ -3743,6 +3746,474 @@ async def test_http3_goaway_handling(server: Server, configuration: QuicConfigur
         logger.info(f"H3G Test ({server.name}): Test finished. Overall result: {result_status}.")
 
 
+async def test_http3_max_push_id_handling(server: Server, configuration: QuicConfiguration):
+    """
+    Tests the client's handling of MAX_PUSH_ID and subsequent PUSH_PROMISE frames.
+    1. Establish H3 connection, make an initial GET request.
+    2. Simulate server sending MAX_PUSH_ID.
+    3. Simulate server sending a PUSH_PROMISE with an ID exceeding the MAX_PUSH_ID limit.
+    4. Verify client sends CANCEL_PUSH.
+    """
+    if server.path is None: # Path needed for the initial GET request
+        print(f"H3MPI Test ({server.name}): No server.path defined. Skipping test.")
+        return
+    if server.push_path is None: # Also needs a path for the PUSH_PROMISE itself
+        print(f"H3MPI Test ({server.name}): No server.push_path defined for PUSH_PROMISE. Skipping test.")
+        # Fallback or use server.path if push_path is not distinct
+        promised_path = server.path + "/promised"
+    else:
+        promised_path = server.push_path
+
+
+    quic_logger = QuicLogger()
+    original_quic_logger = configuration.quic_logger
+    configuration.quic_logger = quic_logger
+    configuration.alpn_protocols = H3_ALPN
+
+    from aioquic.h3.connection import FrameType as H3FrameType, encode_frame
+    from aioquic.quic.events import StreamDataReceived
+    from aioquic.buffer import encode_uint_var
+    from aioquic.quic.connection import QuicConnectionError
+
+    logger_main = logging.getLogger("interop")
+
+    client_request_stream_id = None # Will be set after initial GET
+
+    async with connect(
+        server.host,
+        server.http3_port or server.port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as protocol:
+        http_client = cast(HttpClient, protocol)
+        logger = http_client._quic._logger
+        h3_conn = http_client._http
+
+        logger.info(f"H3MPI Test ({server.name}): Connected. Performing initial GET request.")
+        try:
+            # Client-initiated BIDI streams: 0, 4, 8...
+            # The first GET request will use stream 0.
+            client_request_stream_id = 0 # Expected stream ID for the first client GET
+            response_events = await http_client.get(
+                f"https://{server.host}:{server.http3_port or server.port}{server.path}"
+            )
+            if not response_events or not isinstance(response_events[0], HeadersReceived) or \
+               not (cast(HeadersReceived, response_events[0]).status_code // 100 == 2):
+                status = cast(HeadersReceived, response_events[0]).status_code if response_events and isinstance(response_events[0], HeadersReceived) else "N/A"
+                logger.error(f"H3MPI Test ({server.name}): Initial GET request failed or non-2xx status: {status}. Aborting.")
+                configuration.quic_logger = original_quic_logger
+                return
+            logger.info(f"H3MPI Test ({server.name}): Initial GET request successful on stream {client_request_stream_id}.")
+        except Exception as e:
+            logger.error(f"H3MPI Test ({server.name}): Exception during initial GET: {e}. Aborting.", exc_info=True)
+            configuration.quic_logger = original_quic_logger
+            return
+
+        # Simulate MAX_PUSH_ID from Server
+        server_control_stream_id = h3_conn._stream_id_control_remote
+        if server_control_stream_id is None:
+            logger.error(f"H3MPI Test ({server.name}): Server's H3 control stream ID not found. Aborting.")
+            configuration.quic_logger = original_quic_logger
+            return
+        
+        max_push_id_value = 5
+        max_push_id_bytes = encode_uint_var(max_push_id_value)
+        max_push_id_frame_bytes = encode_frame(H3FrameType.MAX_PUSH_ID, max_push_id_bytes)
+        
+        logger.info(f"H3MPI Test ({server.name}): Injecting MAX_PUSH_ID ({max_push_id_value}) frame on stream {server_control_stream_id}.")
+        h3_conn.handle_event(
+            StreamDataReceived(stream_id=server_control_stream_id, data=max_push_id_frame_bytes, end_stream=False)
+        )
+        await asyncio.sleep(0.1) # Allow client to process MAX_PUSH_ID
+
+        # Simulate Illicit PUSH_PROMISE
+        push_id_to_test = max_push_id_value + 1
+        
+        # Construct PUSH_PROMISE frame payload
+        push_id_bytes_for_promise = encode_uint_var(push_id_to_test)
+        
+        # Encode dummy headers for the PUSH_PROMISE
+        # Note: h3_conn._encode_headers is protected; use public methods if available or reconstruct.
+        # For testing, we can assume a simplified header encoding if direct access is an issue.
+        # A more robust way would be to use a known set of bytes for a simple header block.
+        # For now, let's try to use the internal encoder, acknowledging it's not ideal for external use.
+        try:
+            # These are example headers for a promised resource.
+            headers_to_encode = [
+                (b":method", b"GET"), 
+                (b":scheme", b"https"),
+                (b":authority", server.host.encode('utf-8')),
+                (b":path", promised_path.encode('utf-8'))
+            ]
+            encoded_header_bytes = h3_conn._encode_headers(headers_to_encode)
+        except Exception as e_header_encode:
+            logger.error(f"H3MPI Test ({server.name}): Could not encode headers for PUSH_PROMISE: {e_header_encode}. Using pre-canned header block if possible or aborting.", exc_info=True)
+            # As a fallback, one might have a fixed, known-good encoded header block here.
+            # For now, if encoding fails, we can't proceed reliably.
+            configuration.quic_logger = original_quic_logger
+            return
+
+        push_promise_payload = push_id_bytes_for_promise + encoded_header_bytes
+        push_promise_frame_bytes = encode_frame(H3FrameType.PUSH_PROMISE, push_promise_payload)
+
+        logger.info(f"H3MPI Test ({server.name}): Injecting PUSH_PROMISE for push ID {push_id_to_test} (exceeds limit {max_push_id_value}) on request stream {client_request_stream_id}.")
+        h3_conn.handle_event(
+            StreamDataReceived(stream_id=client_request_stream_id, data=push_promise_frame_bytes, end_stream=False)
+        )
+        await asyncio.sleep(0.2) # Allow client to process PUSH_PROMISE and react
+
+        # Verification
+        if push_id_to_test in http_client.pushes:
+            logger.error(f"H3MPI Test ({server.name}): Push ID {push_id_to_test} was found in client.pushes, but it should have been rejected.")
+        else:
+            logger.info(f"H3MPI Test ({server.name}): Push ID {push_id_to_test} correctly not found in client.pushes.")
+            
+            # Check logger for CANCEL_PUSH
+            cancel_push_found = False
+            try:
+                log_data = quic_logger.to_dict()
+                for trace in log_data.get("traces", []):
+                    for event in trace.get("events", []):
+                        if event.get("name") == "transport:packet_sent": # Frame was sent
+                            packet_data = event.get("data", {})
+                            for frame in packet_data.get("frames", []):
+                                if frame.get("frame_type") == "cancel_push": # H3FrameType.CANCEL_PUSH.value might be more robust if qlog uses values
+                                    logged_push_id = frame.get("push_id") # Assuming qlog format uses 'push_id'
+                                    if logged_push_id == push_id_to_test:
+                                        logger.info(f"H3MPI Test ({server.name}): CANCEL_PUSH frame for push ID {push_id_to_test} found in sent packets.")
+                                        cancel_push_found = True
+                                        break
+                            if cancel_push_found: break
+                    if cancel_push_found: break
+            except Exception as e_log:
+                logger.error(f"H3MPI Test ({server.name}): Error inspecting QUIC log for CANCEL_PUSH: {e_log}", exc_info=True)
+
+            if cancel_push_found:
+                logger.info(f"H3MPI Test ({server.name}): Client correctly sent CANCEL_PUSH. Test successful.")
+                server.result |= Result.H3MPI
+            else:
+                logger.error(f"H3MPI Test ({server.name}): Client did not send CANCEL_PUSH for push ID {push_id_to_test}.")
+
+    except QuicConnectionError as e:
+        logger.error(f"H3MPI Test ({server.name}): QuicConnectionError during test: {e.error_code} - {e.reason_phrase}", exc_info=True)
+    except Exception as e:
+        logger.error(f"H3MPI Test ({server.name}): Unexpected exception: {e}", exc_info=True)
+    finally:
+        configuration.quic_logger = original_quic_logger
+        if hasattr(quic_logger, 'close') and callable(quic_logger.close):
+            quic_logger.close()
+        result_status = "successful" if server.result & Result.H3MPI else "failed"
+        logger.info(f"H3MPI Test ({server.name}): Test finished. Overall result: {result_status}.")
+
+
+async def test_0rtt_alpn_mismatch_fallback(server: Server, configuration: QuicConfiguration):
+    """
+    Tests the client's ability to fall back to 1-RTT if 0-RTT is rejected
+    due to an ALPN mismatch.
+    """
+    if server.path is None:
+        print(f"ZAMF Test ({server.name}): No server.path defined. Skipping test.")
+        return
+
+    logger_main = logging.getLogger("interop")
+    saved_ticket_holder = [None]
+
+    def session_ticket_handler(ticket):
+        saved_ticket_holder[0] = ticket
+        logger_main.info(f"ZAMF Test ({server.name}): Session ticket received in Phase 1.")
+
+    # --- Phase 1: Obtain Session Ticket ---
+    logger_main.info(f"ZAMF Test ({server.name}): Starting Phase 1 - Obtain session ticket with ALPN {H3_ALPN[0]}.")
+    
+    config_phase1 = QuicConfiguration(
+        alpn_protocols=H3_ALPN, # Standard ALPN for H3
+        is_client=True,
+        session_ticket_handler=session_ticket_handler,
+        # For logging, use a distinct path if the main logger is file-based
+        quic_logger=QuicFileLogger(configuration.quic_logger.path + "_zamf_p1") if hasattr(configuration.quic_logger, 'path') and configuration.quic_logger.path else QuicLogger(),
+        secrets_log_file=configuration.secrets_log_file, # Reuse from main config
+        verify_mode=configuration.verify_mode, # Reuse from main config
+    )
+    phase1_secrets_log_obj = None
+    if config_phase1.secrets_log_file and isinstance(config_phase1.secrets_log_file, str):
+        try:
+            phase1_secrets_log_obj = open(config_phase1.secrets_log_file, "a")
+            config_phase1.secrets_log_file = phase1_secrets_log_obj
+        except Exception as e:
+            logger_main.error(f"ZAMF Test ({server.name}): Error opening secrets log for Phase 1: {e}")
+
+
+    try:
+        async with connect(
+            server.host,
+            server.http3_port or server.port,
+            configuration=config_phase1,
+            create_protocol=HttpClient,
+        ) as protocol_p1:
+            http_client_p1 = cast(HttpClient, protocol_p1)
+            logger_p1 = http_client_p1._quic._logger
+            logger_p1.info(f"ZAMF Test ({server.name}): Phase 1 connected. Performing GET.")
+            response_p1 = await http_client_p1.get(
+                f"https://{server.host}:{server.http3_port or server.port}{server.path}"
+            )
+            if not response_p1 or not isinstance(response_p1[0], HeadersReceived) or \
+               not (cast(HeadersReceived, response_p1[0]).status_code // 100 == 2):
+                status_p1 = cast(HeadersReceived, response_p1[0]).status_code if response_p1 and isinstance(response_p1[0], HeadersReceived) else "N/A"
+                logger_main.error(f"ZAMF Test ({server.name}): Phase 1 GET request failed or non-2xx status: {status_p1}. Aborting.")
+                if phase1_secrets_log_obj: phase1_secrets_log_obj.close()
+                if hasattr(config_phase1.quic_logger, 'close'): config_phase1.quic_logger.close()
+                return
+            
+            logger_p1.info(f"ZAMF Test ({server.name}): Phase 1 GET successful. Waiting for ticket.")
+            await asyncio.sleep(0.5) # Allow time for ticket to be sent/processed
+        logger_main.info(f"ZAMF Test ({server.name}): Phase 1 connection closed.")
+    except Exception as e:
+        logger_main.error(f"ZAMF Test ({server.name}): Exception during Phase 1: {e}. Aborting.", exc_info=True)
+        if phase1_secrets_log_obj: phase1_secrets_log_obj.close()
+        if hasattr(config_phase1.quic_logger, 'close'): config_phase1.quic_logger.close()
+        return
+    finally:
+        if phase1_secrets_log_obj: phase1_secrets_log_obj.close()
+        if hasattr(config_phase1.quic_logger, 'close') and callable(config_phase1.quic_logger.close):
+            config_phase1.quic_logger.close()
+
+
+    if saved_ticket_holder[0] is None:
+        logger_main.warning(f"ZAMF Test ({server.name}): Did not receive a session ticket in Phase 1. Cannot test 0-RTT ALPN mismatch fallback.")
+        return
+
+    logger_main.info(f"ZAMF Test ({server.name}): Session ticket obtained. Starting Phase 2 - Attempt 0-RTT with mismatched ALPN.")
+
+    # --- Phase 2: Attempt 0-RTT with Mismatched ALPN ---
+    mismatched_alpn = ["dummy/test-alpn-zamf"]
+    config_phase2 = QuicConfiguration(
+        alpn_protocols=mismatched_alpn,
+        is_client=True,
+        session_ticket=saved_ticket_holder[0],
+        quic_logger=QuicFileLogger(configuration.quic_logger.path + "_zamf_p2") if hasattr(configuration.quic_logger, 'path') and configuration.quic_logger.path else QuicLogger(),
+        secrets_log_file=configuration.secrets_log_file,
+        verify_mode=configuration.verify_mode,
+    )
+    phase2_secrets_log_obj = None
+    if config_phase2.secrets_log_file and isinstance(config_phase2.secrets_log_file, str):
+        try:
+            phase2_secrets_log_obj = open(config_phase2.secrets_log_file, "a")
+            config_phase2.secrets_log_file = phase2_secrets_log_obj
+        except Exception as e:
+            logger_main.error(f"ZAMF Test ({server.name}): Error opening secrets log for Phase 2: {e}")
+
+    all_checks_passed = False
+    try:
+        async with connect(
+            server.host,
+            server.http3_port or server.port,
+            configuration=config_phase2,
+            create_protocol=HttpClient,
+        ) as protocol_p2:
+            http_client_p2 = cast(HttpClient, protocol_p2)
+            q_conn_p2 = http_client_p2._quic
+            logger_p2 = q_conn_p2._logger
+
+            logger_p2.info(f"ZAMF Test ({server.name}): Phase 2 connection attempt initiated with ALPN {mismatched_alpn[0]}.")
+            
+            # Connection should complete via 1-RTT handshake
+            await q_conn_p2.wait_handshake_confirmed() # Wait for 1-RTT handshake to complete
+            logger_p2.info(f"ZAMF Test ({server.name}): Phase 2 handshake confirmed.")
+
+            early_data_accepted = q_conn_p2.tls.early_data_accepted
+            handshake_completed = q_conn_p2.is_handshake_completed
+            negotiated_alpn = q_conn_p2.alpn_protocol
+
+            logger_p2.info(f"ZAMF Test ({server.name}): Early data accepted: {early_data_accepted}")
+            logger_p2.info(f"ZAMF Test ({server.name}): Handshake completed: {handshake_completed}")
+            logger_p2.info(f"ZAMF Test ({server.name}): Negotiated ALPN: {negotiated_alpn}")
+
+            if early_data_accepted:
+                logger_main.error(f"ZAMF Test ({server.name}): Early data was accepted despite ALPN mismatch. Test failed.")
+            elif not handshake_completed:
+                logger_main.error(f"ZAMF Test ({server.name}): 1-RTT fallback handshake did not complete. Test failed.")
+            elif negotiated_alpn == mismatched_alpn[0]:
+                logger_main.error(f"ZAMF Test ({server.name}): Mismatched ALPN '{mismatched_alpn[0]}' was negotiated. Expected fallback to server-supported ALPN. Test failed.")
+            elif negotiated_alpn not in H3_ALPN : # Assuming server supports H3_ALPN
+                 logger_main.error(f"ZAMF Test ({server.name}): Negotiated ALPN '{negotiated_alpn}' is not one of the expected fallback ALPNs ({H3_ALPN}). Test failed.")
+            else:
+                logger_main.info(f"ZAMF Test ({server.name}): Correctly fell back to 1-RTT and negotiated ALPN '{negotiated_alpn}'.")
+                
+                # Attempt a GET request to ensure connection is usable
+                logger_p2.info(f"ZAMF Test ({server.name}): Attempting GET request on fallback connection.")
+                response_p2 = await http_client_p2.get(
+                    f"https://{server.host}:{server.http3_port or server.port}{server.path}?phase2=true"
+                )
+                if response_p2 and isinstance(response_p2[0], HeadersReceived) and \
+                   (cast(HeadersReceived, response_p2[0]).status_code // 100 == 2):
+                    logger_main.info(f"ZAMF Test ({server.name}): GET request on fallback 1-RTT connection successful. All checks passed.")
+                    all_checks_passed = True
+                else:
+                    status_p2 = cast(HeadersReceived, response_p2[0]).status_code if response_p2 and isinstance(response_p2[0], HeadersReceived) else "N/A"
+                    logger_main.error(f"ZAMF Test ({server.name}): GET request on fallback 1-RTT connection failed or non-2xx status: {status_p2}. Test failed.")
+        
+        if all_checks_passed:
+            server.result |= Result.ZAMF
+
+    except Exception as e:
+        logger_main.error(f"ZAMF Test ({server.name}): Exception during Phase 2: {e}. Test failed.", exc_info=True)
+    finally:
+        if phase2_secrets_log_obj: phase2_secrets_log_obj.close()
+        if hasattr(config_phase2.quic_logger, 'close') and callable(config_phase2.quic_logger.close):
+            config_phase2.quic_logger.close()
+        
+        result_status = "successful" if server.result & Result.ZAMF else "failed"
+        logger_main.info(f"ZAMF Test ({server.name}): Test finished. Overall result: {result_status}.")
+
+
+async def test_http3_duplicate_settings_error(server: Server, configuration: QuicConfiguration):
+    """
+    Tests the server's handling of a client sending a duplicate SETTINGS frame.
+    The server should treat this as a connection error.
+    """
+    if server.path is None: # Path needed for initial GET/ping if HttpClient requires it
+        print(f"H3DSF Test ({server.name}): No server.path defined. Using default for any initial interaction.")
+    
+    quic_logger = QuicLogger()
+    original_quic_logger = configuration.quic_logger
+    configuration.quic_logger = quic_logger
+    configuration.alpn_protocols = H3_ALPN
+
+    from aioquic.h3.connection import FrameType as H3FrameType, encode_frame, encode_settings, ErrorCode as H3ErrorCode
+    from aioquic.quic.connection import QuicConnectionError
+    from aioquic.quic.packet import QuicErrorCode as QuicTransportErrorCode
+
+
+    logger_main = logging.getLogger("interop")
+
+    async with connect(
+        server.host,
+        server.http3_port or server.port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as protocol:
+        http_client = cast(HttpClient, protocol)
+        logger = http_client._quic._logger
+        h3_conn = http_client._http
+        q_conn = http_client._quic
+
+        logger.info(f"H3DSF Test ({server.name}): Connected. Ensuring H3 setup with initial ping.")
+        try:
+            await http_client.ping()
+            logger.info(f"H3DSF Test ({server.name}): Initial ping successful. H3 control streams established.")
+        except Exception as e:
+            logger.error(f"H3DSF Test ({server.name}): Initial ping failed: {e}. Aborting.", exc_info=True)
+            configuration.quic_logger = original_quic_logger
+            return
+
+        client_control_stream_id = h3_conn._stream_id_control_local
+        if client_control_stream_id is None:
+            logger.error(f"H3DSF Test ({server.name}): Client's local H3 control stream ID is None. Aborting.")
+            configuration.quic_logger = original_quic_logger
+            return
+        logger.info(f"H3DSF Test ({server.name}): Client's local H3 control stream ID: {client_control_stream_id}.")
+
+        # Construct duplicate SETTINGS frame (empty settings is fine)
+        settings_payload = encode_settings({})
+        duplicate_settings_frame_bytes = encode_frame(H3FrameType.SETTINGS, settings_payload)
+        
+        logger.info(f"H3DSF Test ({server.name}): Sending duplicate SETTINGS frame on stream {client_control_stream_id}.")
+        q_conn.send_stream_data(client_control_stream_id, duplicate_settings_frame_bytes, end_stream=False)
+        # Ensure this data is flushed out
+        await http_client.ping() # This ping itself might fail now, or the next one will.
+
+        connection_closed_by_server_with_error = False
+        try:
+            # Attempt further communication, expecting failure
+            logger.info(f"H3DSF Test ({server.name}): Attempting another ping, expecting connection to be closed by server.")
+            await asyncio.wait_for(http_client.ping(), timeout=2.0) # Shorter timeout
+            logger.warning(f"H3DSF Test ({server.name}): Ping after sending duplicate SETTINGS succeeded. Server might not have processed/reacted yet or ignored it.")
+            # Give a bit more time for server to react if ping didn't fail immediately
+            await asyncio.sleep(1.0) 
+            if not q_conn._is_closed: # Check if connection is still open
+                 logger.error(f"H3DSF Test ({server.name}): Connection remained open after duplicate SETTINGS and subsequent ping/wait. Server did not close as expected.")
+
+        except QuicConnectionError as e:
+            logger.info(f"H3DSF Test ({server.name}): QuicConnectionError caught as expected: {e.error_code} - {e.reason_phrase}")
+            # This is an expected outcome. Now verify the qlog for server's CONNECTION_CLOSE.
+            # The error 'e' here is often a local client-side error due to connection termination (e.g. ConnectionResetError),
+            # not necessarily the error code sent by the server in CONNECTION_CLOSE.
+            connection_closed_by_server_with_error = True # Assume for now, qlog will verify
+        except asyncio.TimeoutError:
+            logger.info(f"H3DSF Test ({server.name}): Timeout waiting for ping after duplicate SETTINGS. Connection likely closed or unresponsive.")
+            connection_closed_by_server_with_error = True # Assume for now
+        except Exception as e:
+            logger.error(f"H3DSF Test ({server.name}): Unexpected exception after sending duplicate SETTINGS: {e}", exc_info=True)
+            # If it's an unexpected error, we might not be able to check qlog properly.
+
+        # Inspect logger for server-initiated CONNECTION_CLOSE with H3_FRAME_UNEXPECTED
+        if q_conn._is_closed or connection_closed_by_server_with_error: # Check logs if connection is known/assumed closed
+            logger.info(f"H3DSF Test ({server.name}): Connection is closed. Inspecting logs for server's CONNECTION_CLOSE reason.")
+            found_expected_close = False
+            expected_h3_error = H3ErrorCode.H3_FRAME_UNEXPECTED # 0x105
+            
+            try:
+                log_data = quic_logger.to_dict()
+                for trace in log_data.get("traces", []):
+                    for event in trace.get("events", []):
+                        event_data = event.get("data", {})
+                        if event.get("name") == "transport:packet_received":
+                            for frame in event_data.get("frames", []):
+                                if frame.get("frame_type") == "connection_close":
+                                    # Check for QUIC Application Error (0x1d) with H3 code, or general QUIC error
+                                    quic_error_code = frame.get("error_code")
+                                    application_error_code = frame.get("application_error_code") # For type 0x1d
+                                    error_reason = frame.get("reason_phrase", "")
+                                    
+                                    logger.info(f"H3DSF Test ({server.name}): Server sent CONNECTION_CLOSE. QUIC Code: {quic_error_code}, App Code: {application_error_code}, Reason: '{error_reason}'")
+
+                                    if frame.get("close_type") == "application_close" and application_error_code == expected_h3_error.value:
+                                        logger.info(f"H3DSF Test ({server.name}): Server correctly closed with H3_FRAME_UNEXPECTED (0x1d type).")
+                                        found_expected_close = True
+                                        break
+                                    # Some servers might send a general QUIC error code if they map H3 errors to transport errors differently
+                                    # or if the H3 layer signals a generic error to the QUIC layer.
+                                    # For this specific test (duplicate SETTINGS), H3_FRAME_UNEXPECTED is most appropriate.
+                                    # We could also accept H3_ID_ERROR (0x108) or H3_STREAM_CREATION_ERROR (0x103) if server misinterprets
+                                    # the stream for SETTINGS, though less accurate for duplicate SETTINGS.
+                                    # Or a general FRAME_ERROR (0x102 from QUIC) if it's treated as a transport issue.
+                                    elif quic_error_code == QuicTransportErrorCode.APPLICATION_ERROR and \
+                                         (application_error_code is None or application_error_code == expected_h3_error.value): # Older qlog might not split app code
+                                          logger.info(f"H3DSF Test ({server.name}): Server closed with QUIC APPLICATION_ERROR, potentially due to H3_FRAME_UNEXPECTED.")
+                                          found_expected_close = True # Acceptable
+                                          break
+                                    elif quic_error_code == expected_h3_error.value: # If H3 error code is directly in QUIC field
+                                        logger.info(f"H3DSF Test ({server.name}): Server closed with QUIC error code matching H3_FRAME_UNEXPECTED value.")
+                                        found_expected_close = True
+                                        break
+                        if found_expected_close: break
+                    if found_expected_close: break
+                
+                if found_expected_close:
+                    logger.info(f"H3DSF Test ({server.name}): Test successful. Server closed connection with an expected error.")
+                    server.result |= Result.H3DSF
+                else:
+                    logger.error(f"H3DSF Test ({server.name}): Server closed connection, but not with H3_FRAME_UNEXPECTED or a clearly related error. Logged close details might provide more info.")
+
+            except Exception as e_log:
+                logger.error(f"H3DSF Test ({server.name}): Error inspecting QUIC log: {e_log}", exc_info=True)
+        elif not connection_closed_by_server_with_error : # Connection not closed after operations
+             logger.error(f"H3DSF Test ({server.name}): Server did not close the connection after receiving a duplicate SETTINGS frame. Test failed.")
+
+
+    except QuicConnectionError as e: # Catch errors during connect() or initial ping
+        logger.error(f"H3DSF Test ({server.name}): QuicConnectionError during initial setup: {e.error_code} - {e.reason_phrase}", exc_info=True)
+    except Exception as e:
+        logger.error(f"H3DSF Test ({server.name}): Unexpected exception during test: {e}", exc_info=True)
+    finally:
+        configuration.quic_logger = original_quic_logger
+        if hasattr(quic_logger, 'close') and callable(quic_logger.close):
+            quic_logger.close()
+        
+        result_status = "successful" if server.result & Result.H3DSF else "failed"
+        logger.info(f"H3DSF Test ({server.name}): Test finished. Overall result: {result_status}.")
+
+
 def print_result(server: Server) -> None:
     result = str(server.result) # __str__ now handles '3' and all char mappings
     # Total 35 flags: VHDCRZSQ MBLUEPT3 dpmsbvcw IYXKNGzq u
@@ -3756,7 +4227,7 @@ def print_result(server: Server) -> None:
         + " "
         + result[24:32]
         + " "
-        + result[32:35]
+        + result[32:38]  # Updated to include 6 flags in the last group
     )
     print("%s%s%s" % (server.name, " " * (20 - len(server.name)), result_str))
 
