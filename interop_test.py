@@ -24,7 +24,7 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.logger import QuicFileLogger, QuicLogger
 from aioquic.quic.connection import QuicConnectionError
 from aioquic.quic.packet import QuicErrorCode, PacketType
-from aioquic.quic.frames import NewConnectionIdFrame
+from aioquic.quic.frames import NewConnectionIdFrame, RetireConnectionIdFrame, PathChallengeFrame
 import os
 
 
@@ -950,6 +950,389 @@ async def test_nci_invalid_length(server: Server, configuration: QuicConfigurati
     # This is tricky; ideally, configuration object shouldn't be modified in place by tests,
     # or test runner should provide fresh configs.
     configuration.quic_logger = original_logger
+
+
+async def test_retire_cid_out_of_range(server: Server, configuration: QuicConfiguration):
+    """
+    Tests server handling of a RETIRE_CONNECTION_ID frame with an out-of-range
+    sequence number, as per RFC9000 Section 19.16 and Section 10.3.
+
+    Scenario:
+    1. Client establishes an HTTP/3 connection.
+    2. Client sends a RETIRE_CONNECTION_ID frame with a very large sequence number
+       (e.g., 99999) that the server could not have issued.
+
+    Expected outcome:
+    The server should treat this as a connection error of type PROTOCOL_VIOLATION
+    and close the connection with error code 0x0a.
+    """
+    if not server.http3: # Using H3 context for consistency
+        print(f"[{server.name}] Skipping test_retire_cid_out_of_range as it's not an HTTP/3 server.")
+        return
+
+    print(f"\n[{server.name}] Starting test_retire_cid_out_of_range")
+    
+    # Clear logger events if possible, to focus on this test's events.
+    if hasattr(configuration.quic_logger, "_events") and isinstance(configuration.quic_logger._events, list):
+        configuration.quic_logger._events.clear()
+    elif hasattr(configuration.quic_logger, "events") and isinstance(configuration.quic_logger.events, list):
+         configuration.quic_logger.events.clear()
+
+    test_passed = False
+    try:
+        async with connect(
+            server.host,
+            server.http3_port or server.port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+        ) as client:
+            client = cast(HttpClient, client)
+            await client.wait_connected() # Ensure handshake is complete
+            print(f"[{server.name}] test_retire_cid_out_of_range: Connection established.")
+
+            out_of_range_sequence_number = 99999
+            rci_frame = RetireConnectionIdFrame(sequence_number=out_of_range_sequence_number)
+            
+            print(f"[{server.name}] test_retire_cid_out_of_range: Sending RETIRE_CONNECTION_ID frame with seq={out_of_range_sequence_number}.")
+            client._quic._send_frame(rci_frame, packet_type=PacketType.ONE_RTT)
+            
+            print(f"[{server.name}] test_retire_cid_out_of_range: Frame sent. Waiting for server reaction...")
+            for _ in range(10): # Try pinging/sleeping a few times
+                await asyncio.sleep(0.1)
+                if client._quic._close_event is not None and client._quic._close_event.error_code == QuicErrorCode.PROTOCOL_VIOLATION:
+                    print(f"[{server.name}] test_retire_cid_out_of_range: Server closed with PROTOCOL_VIOLATION (from _close_event).")
+                    test_passed = True
+                    break
+                await client.ping()
+            
+            if not test_passed and client._quic._close_event is not None:
+                 print(f"[{server.name}] test_retire_cid_out_of_range: Server closed with different error: {client._quic._close_event.error_code} (expected {QuicErrorCode.PROTOCOL_VIOLATION})")
+            elif not test_passed:
+                 print(f"[{server.name}] test_retire_cid_out_of_range: Server did not close connection as expected after invalid RCI frame.")
+
+    except QuicConnectionError as e:
+        if e.quic_error_code == QuicErrorCode.PROTOCOL_VIOLATION:
+            print(f"[{server.name}] test_retire_cid_out_of_range: Caught expected QuicConnectionError with PROTOCOL_VIOLATION (0x0a).")
+            test_passed = True
+        else:
+            print(f"[{server.name}] test_retire_cid_out_of_range: Caught QuicConnectionError with unexpected code: {e.quic_error_code} (expected 0x0a), reason: {e.reason_phrase}.")
+    except ConnectionAbortedError as e:
+        print(f"[{server.name}] test_retire_cid_out_of_range: ConnectionAbortedError: {e}.")
+    except Exception as e:
+        print(f"[{server.name}] test_retire_cid_out_of_range: An unexpected error occurred: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Fallback log check
+    if not test_passed and hasattr(configuration.quic_logger, "to_dict"):
+        try:
+            log_data = configuration.quic_logger.to_dict()
+            for trace_wrapper in log_data.get("traces", []):
+                for event_entry in trace_wrapper.get("events", []):
+                    event_name = event_entry.get("name")
+                    event_data = event_entry.get("data")
+                    if event_name == "transport:connection_closed" and event_data.get("error_code") == QuicErrorCode.PROTOCOL_VIOLATION:
+                        print(f"[{server.name}] test_retire_cid_out_of_range: Verified PROTOCOL_VIOLATION (0x0a) in logs.")
+                        test_passed = True
+                        break
+                if test_passed: break
+        except Exception as log_e:
+            print(f"[{server.name}] test_retire_cid_out_of_range: Error analyzing QuicLogger for fallback: {log_e}")
+
+    if test_passed:
+        print(f"[{server.name}] test_retire_cid_out_of_range: PASSED.")
+        server.result |= Result.M
+    else:
+        print(f"[{server.name}] test_retire_cid_out_of_range: FAILED.")
+
+
+async def test_path_challenge_response_initial_addr(server: Server, configuration: QuicConfiguration):
+    """
+    Tests server response to a PATH_CHALLENGE frame sent after handshake confirmation
+    to the server's initial address, as per RFC9000 Section 8.2.
+
+    Scenario:
+    1. Client establishes an HTTP/3 connection and waits for handshake confirmation.
+    2. Client sends a PATH_CHALLENGE frame with unique data to the server.
+    3. Client monitors received packets (via QuicLogger) for a PATH_RESPONSE frame.
+
+    Expected outcome:
+    The server should respond with a PATH_RESPONSE frame containing the exact same
+    data as sent in the PATH_CHALLENGE frame. The test verifies this by checking
+    the QuicLogger output.
+    """
+    if not server.http3: # Using H3 context for consistency
+        print(f"[{server.name}] Skipping test_path_challenge_response_initial_addr as it's not an HTTP/3 server.")
+        return
+
+    print(f"\n[{server.name}] Starting test_path_challenge_response_initial_addr")
+    
+    # Clear logger events if possible
+    if hasattr(configuration.quic_logger, "_events") and isinstance(configuration.quic_logger._events, list):
+        configuration.quic_logger._events.clear()
+    elif hasattr(configuration.quic_logger, "events") and isinstance(configuration.quic_logger.events, list):
+         configuration.quic_logger.events.clear()
+
+    test_passed = False
+    challenge_data_sent = os.urandom(8)
+
+    try:
+        async with connect(
+            server.host,
+            server.http3_port or server.port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+        ) as client:
+            client = cast(HttpClient, client)
+            
+            print(f"[{server.name}] test_path_challenge_response_initial_addr: Waiting for handshake confirmed...")
+            await client.wait_handshake_confirmed()
+            print(f"[{server.name}] test_path_challenge_response_initial_addr: Handshake confirmed.")
+
+            pc_frame = PathChallengeFrame(data=challenge_data_sent)
+            
+            print(f"[{server.name}] test_path_challenge_response_initial_addr: Sending PATH_CHALLENGE frame with data: {challenge_data_sent.hex()}.")
+            client._quic._send_frame(pc_frame, packet_type=PacketType.ONE_RTT)
+            
+            print(f"[{server.name}] test_path_challenge_response_initial_addr: Frame sent. Waiting for PATH_RESPONSE (up to 5s)...")
+            
+            # Wait for server response by checking logger periodically
+            # Total wait time: 5 seconds (50 * 0.1s)
+            for _ in range(50): 
+                await asyncio.sleep(0.1)
+                if hasattr(configuration.quic_logger, "to_dict"):
+                    try:
+                        log_data = configuration.quic_logger.to_dict()
+                        for trace_wrapper in log_data.get("traces", []):
+                            for event_entry in trace_wrapper.get("events", []):
+                                event_name = event_entry.get("name")
+                                event_data = event_entry.get("data")
+                                if event_name == "transport:packet_received":
+                                    for frame in event_data.get("frames", []):
+                                        if frame.get("frame_type") == "path_response":
+                                            response_data_hex = frame.get("data")
+                                            if response_data_hex:
+                                                response_data = bytes.fromhex(response_data_hex)
+                                                print(f"[{server.name}] test_path_challenge_response_initial_addr: Received PATH_RESPONSE with data: {response_data.hex()}")
+                                                if response_data == challenge_data_sent:
+                                                    print(f"[{server.name}] test_path_challenge_response_initial_addr: PATH_RESPONSE data matches sent PATH_CHALLENGE data.")
+                                                    test_passed = True
+                                                    break
+                                    if test_passed: break
+                            if test_passed: break
+                        if test_passed: break
+                    except Exception as log_e:
+                        print(f"[{server.name}] test_path_challenge_response_initial_addr: Error analyzing QuicLogger during wait: {log_e}")
+                if test_passed:
+                    break
+            
+            if not test_passed:
+                print(f"[{server.name}] test_path_challenge_response_initial_addr: Timed out waiting for matching PATH_RESPONSE frame.")
+            
+            # Allow connection to close gracefully via async with
+            print(f"[{server.name}] test_path_challenge_response_initial_addr: Test actions complete, closing connection.")
+
+    except QuicConnectionError as e:
+        print(f"[{server.name}] test_path_challenge_response_initial_addr: QuicConnectionError: {e.reason_phrase} (Code: {e.quic_error_code}).")
+    except ConnectionAbortedError as e:
+        print(f"[{server.name}] test_path_challenge_response_initial_addr: ConnectionAbortedError: {e}.")
+    except Exception as e:
+        print(f"[{server.name}] test_path_challenge_response_initial_addr: An unexpected error occurred: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Final verification based on test_passed flag set during the wait loop
+    if test_passed:
+        print(f"[{server.name}] test_path_challenge_response_initial_addr: PASSED.")
+        server.result |= Result.M
+    else:
+        print(f"[{server.name}] test_path_challenge_response_initial_addr: FAILED. No matching PATH_RESPONSE received or an error occurred.")
+
+
+async def test_nci_retire_prior_to_non_applicable(server: Server, configuration: QuicConfiguration):
+    """
+    Tests client handling of server NEW_CONNECTION_ID frame with a Retire Prior To (RPT)
+    value higher than any client-issued CID sequence number.
+    Relevant RFC9000 sections include Section 5.1.2 (CID Management),
+    Section 19.11 (NEW_CONNECTION_ID frame), and Section 10.3 (Error Handling for CIDs,
+    implicitly testing client does not generate errors).
+
+    Scenario:
+    1. Client establishes an HTTP/3 connection and confirms handshake.
+    2. Client issues a few of its own CIDs to the server (e.g., seq 1, seq 2).
+       The highest client-issued CID sequence is now 2.
+    3. Client performs some activity (e.g., GET request) and waits.
+    4. Test observes (via QuicLogger) if the server sends a NEW_CONNECTION_ID frame
+       with a `retire_prior_to` value > 2 (e.g., RPT=5).
+
+    Expected outcome:
+    If such an NCI frame is received from the server:
+    - The client (aioquic) should correctly process the new CID provided by the server.
+    - Crucially, the client should NOT send RETIRE_CONNECTION_ID frames for any
+      sequence numbers it has not actually issued. For example, if its highest issued
+      CID sequence was 2 and the server's NCI has RPT=5, the client should retire
+      its CIDs with sequence numbers 0, 1, and 2 (if not already retired), but it
+      MUST NOT send RCI frames for sequence numbers 3 or 4.
+    - The connection should remain open and functional, without the client erroneously
+      closing it due to a misinterpretation of the RPT value or by sending invalid RCI frames.
+    The test is opportunistic and passes if this specific scenario is observed and the
+    client (aioquic) handles it correctly by not retiring CIDs it hasn't issued.
+    """
+    if not server.http3:
+        print(f"[{server.name}] Skipping test_nci_retire_prior_to_non_applicable as it's not an HTTP/3 server.")
+        return
+
+    print(f"\n[{server.name}] Starting test_nci_retire_prior_to_non_applicable")
+
+    if hasattr(configuration.quic_logger, "_events") and isinstance(configuration.quic_logger._events, list):
+        configuration.quic_logger._events.clear()
+    elif hasattr(configuration.quic_logger, "events") and isinstance(configuration.quic_logger.events, list):
+        configuration.quic_logger.events.clear()
+
+    max_client_cid_seq_issued = 0 # Client's initial CID for the server is seq 0
+    client_cids_issued_to_server = {0} # Track sequence numbers client has used for CIDs it sent
+
+    scenario_observed_and_passed = False
+    scenario_could_not_be_verified = True # Assume we can't verify until specific NCI is seen
+
+    try:
+        async with connect(
+            server.host,
+            server.http3_port or server.port,
+            configuration=configuration,
+            create_protocol=HttpClient,
+        ) as client:
+            client = cast(HttpClient, client)
+            
+            print(f"[{server.name}] test_nci_rpt_non_applicable: Waiting for handshake confirmed...")
+            await client.wait_handshake_confirmed()
+            print(f"[{server.name}] test_nci_rpt_non_applicable: Handshake confirmed.")
+
+            # Client issues a couple of its own CIDs
+            next_client_cid_seq = 1
+            for _ in range(2): # Issue two CIDs, seq 1 and seq 2
+                if hasattr(client._quic, '_next_local_connection_id_sequence_number'):
+                     # Use the connection's internal counter if available and higher
+                     next_client_cid_seq = max(next_client_cid_seq, client._quic._next_local_connection_id_sequence_number)
+                
+                nci_frame_to_server = NewConnectionIdFrame(
+                    sequence_number=next_client_cid_seq,
+                    retire_prior_to=0, # Client isn't asking server to retire anything yet
+                    connection_id=os.urandom(8), 
+                    stateless_reset_token=os.urandom(16)
+                )
+                print(f"[{server.name}] test_nci_rpt_non_applicable: Client sending NCI (seq={next_client_cid_seq}) to server.")
+                client._quic._send_frame(nci_frame_to_server, packet_type=PacketType.ONE_RTT)
+                client_cids_issued_to_server.add(next_client_cid_seq)
+                max_client_cid_seq_issued = max(max_client_cid_seq_issued, next_client_cid_seq)
+                
+                if hasattr(client._quic, '_next_local_connection_id_sequence_number'):
+                    client._quic._next_local_connection_id_sequence_number = next_client_cid_seq + 1
+                next_client_cid_seq +=1
+            
+            print(f"[{server.name}] test_nci_rpt_non_applicable: Max client CID sequence issued: {max_client_cid_seq_issued}. Client CIDs: {client_cids_issued_to_server}")
+
+            # Perform some activity
+            request_path = server.path if server.path and server.path != "/" else "/"
+            if not request_path.startswith("/"): request_path = "/" + request_path
+            url_host = server.host
+            if "://" not in url_host: url_host = f"https://{server.host}"
+            await client.get(f"{url_host}{request_path}")
+            
+            print(f"[{server.name}] test_nci_rpt_non_applicable: Waiting for server NCI (up to 3s)...")
+            await asyncio.sleep(3.0) # Wait for server to potentially send NCIs
+
+            print(f"[{server.name}] test_nci_rpt_non_applicable: Test actions complete, closing connection.")
+            # Connection closes via async with
+
+    except Exception as e:
+        print(f"[{server.name}] test_nci_rpt_non_applicable: An error occurred during connection phase: {type(e).__name__}: {e}")
+        # Fall through to log analysis, as some relevant frames might have been exchanged.
+        pass
+
+    print(f"[{server.name}] test_nci_rpt_non_applicable: Analyzing QuicLogger trace...")
+    if not hasattr(configuration.quic_logger, "to_dict"):
+        print(f"[{server.name}] test_nci_rpt_non_applicable: QuicLogger not available or cannot be parsed. Skipping analysis.")
+        return
+
+    try:
+        log_data = configuration.quic_logger.to_dict()
+    except Exception as e:
+        print(f"[{server.name}] test_nci_rpt_non_applicable: Failed to convert quic_logger to dict: {e}")
+        return
+
+    client_sent_rci_seqs_after_target_nci = set() 
+    target_nci_observed_time = float('inf')
+
+    for trace_wrapper in log_data.get("traces", []):
+        for event_entry in trace_wrapper.get("events", []):
+            event_name = event_entry.get("name")
+            event_data = event_entry.get("data")
+            event_time = event_entry.get("time", 0) # Assuming time is in ms or comparable units
+
+            if not event_name or not event_data: continue
+
+            if event_name == "transport:packet_received":
+                for frame in event_data.get("frames", []):
+                    if frame.get("frame_type") == "new_connection_id":
+                        server_nci_seq = frame.get("sequence_number")
+                        server_nci_rpt = frame.get("retire_prior_to")
+                        if server_nci_seq is not None and server_nci_rpt is not None:
+                            print(f"[{server.name}] Log: Client RX NCI from server: nci_seq={server_nci_seq}, rpt={server_nci_rpt} at t={event_time}ms")
+                            if server_nci_rpt > max_client_cid_seq_issued:
+                                scenario_could_not_be_verified = False # Target scenario observed
+                                target_nci_observed_time = min(target_nci_observed_time, event_time)
+                                print(f"[{server.name}] test_nci_rpt_non_applicable: Server sent NCI with RPT={server_nci_rpt} > max_client_cid_seq_issued ({max_client_cid_seq_issued}). This is the target scenario.")
+                                # For this NCI, client should retire CIDs in client_cids_issued_to_server with seq < server_nci_rpt.
+                                # It should NOT retire any other CIDs due to this specific RPT.
+                                # We will check client_sent_rci_seqs_after_target_nci later.
+                                # For now, assume client behaves correctly if no explicit error/crash.
+                                scenario_observed_and_passed = True # Tentatively true, will verify RCI behavior below
+            
+            elif event_name == "transport:packet_sent":
+                if event_time >= target_nci_observed_time: # Only consider RCIs sent after observing the target NCI
+                    for frame in event_data.get("frames", []):
+                        if frame.get("frame_type") == "retire_connection_id":
+                            rci_seq = frame.get("sequence_number")
+                            if rci_seq is not None:
+                                client_sent_rci_seqs_after_target_nci.add(int(rci_seq))
+                                print(f"[{server.name}] Log: Client TX RCI for seq={rci_seq} at t={event_time}ms (after target NCI)")
+
+
+    if scenario_could_not_be_verified:
+        print(f"[{server.name}] test_nci_rpt_non_applicable: Server did not send a NEW_CONNECTION_ID frame with Retire Prior To > max client CID sequence ({max_client_cid_seq_issued}). Cannot verify specific scenario.")
+        return
+    
+    if scenario_observed_and_passed: # Target NCI was observed
+        # Verify client's RCI behavior
+        # Client should only have retired CIDs from `client_cids_issued_to_server`
+        # No RCI should be for a sequence number `s` such that `max_client_cid_seq_issued < s < server_nci_rpt_that_triggered_this_check`
+        # This check is implicitly handled if client_sent_rci_seqs_after_target_nci only contains CIDs from client_cids_issued_to_server.
+        spurious_rcis_found = False
+        for retired_seq in client_sent_rci_seqs_after_target_nci:
+            if retired_seq not in client_cids_issued_to_server:
+                # This means client retired a CID it never told the server about. This is a protocol violation on client side.
+                # Or, more relevant to this test: retired a CID it *thinks* it should retire due to high RPT, but hasn't actually issued.
+                print(f"[{server.name}] test_nci_rpt_non_applicable: FAILED. Client sent RETIRE_CONNECTION_ID for seq={retired_seq} which was not in its issued set {client_cids_issued_to_server} after observing a high RPT.")
+                spurious_rcis_found = True
+                scenario_observed_and_passed = False # Override previous optimistic pass
+                break
+        
+        if not spurious_rcis_found:
+             print(f"[{server.name}] test_nci_rpt_non_applicable: Client correctly did not send spurious RCI frames for unissued CIDs after server's high RPT NCI.")
+             # Check if connection remained alive (e.g. no unexpected close with error code)
+             # This is harder to check post-facto without more active probing after the event.
+             # For this test, absence of spurious RCIs is the primary pass condition.
+             # If an error occurred, it would have been caught in the main try-except or the test runner would show it.
+             pass
+
+
+    if scenario_observed_and_passed:
+        print(f"[{server.name}] test_nci_rpt_non_applicable: PASSED. Client correctly handled server NCI with non-applicable RPT.")
+        server.result |= Result.M
+    elif not scenario_could_not_be_verified: # Scenario was observed but failed
+        print(f"[{server.name}] test_nci_rpt_non_applicable: FAILED. Client did not correctly handle server NCI with non-applicable RPT.")
+    # else: scenario_could_not_be_verified is true, already handled.
 
 
 async def test_version_negotiation(server: Server, configuration: QuicConfiguration):
@@ -2539,6 +2922,12 @@ if __name__ == "__main__":
         tests.append(("test_retire_prior_to", test_retire_prior_to))
     if not any(item[0] == "test_nci_invalid_length" for item in tests):
         tests.append(("test_nci_invalid_length", test_nci_invalid_length))
+    if not any(item[0] == "test_retire_cid_out_of_range" for item in tests):
+        tests.append(("test_retire_cid_out_of_range", test_retire_cid_out_of_range))
+    if not any(item[0] == "test_path_challenge_response_initial_addr" for item in tests):
+        tests.append(("test_path_challenge_response_initial_addr", test_path_challenge_response_initial_addr))
+    if not any(item[0] == "test_nci_retire_prior_to_non_applicable" for item in tests):
+        tests.append(("test_nci_retire_prior_to_non_applicable", test_nci_retire_prior_to_non_applicable))
     
     loop = asyncio.get_event_loop()
     loop.run_until_complete(
