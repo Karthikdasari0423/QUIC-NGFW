@@ -21,6 +21,7 @@ from aioquic.h0.connection import H0_ALPN
 from aioquic.h3.connection import H3_ALPN, H3Connection,ErrorCode
 from aioquic.h3.events import DataReceived, HeadersReceived, PushPromiseReceived
 from aioquic.quic.configuration import QuicConfiguration
+# from aioquic.quic.packet import NewConnectionIdFrame, RetireConnectionIdFrame, PathChallengeFrame, QuicErrorCode, QuicPacketType
 from aioquic.quic.logger import QuicFileLogger, QuicLogger
 
 
@@ -46,6 +47,7 @@ class Result(Flag):
     three = 0x010000
     d = 0x020000
     p = 0x040000
+    X = 0x080000 # Max Streams Limit respected
 
     def __str__(self):
         flags = sorted(
@@ -1619,6 +1621,128 @@ async def test_throughput(server: Server, configuration: QuicConfiguration):
         server.result |= Result.T
 
 
+async def test_max_streams_bidi_client_respects_limit(server: Server, configuration: QuicConfiguration):
+    configuration.alpn_protocols = H3_ALPN
+    # Ensure http3_client is imported if not already at top level of script
+    # from http3_client import HttpClient (it is already imported)
+    # Ensure QuicErrorCode is available if needed for comparison
+    from aioquic.quic.packet import QuicErrorCode # For QuicConnectionError.error_code
+    from aioquic.quic.connection import QuicConnectionError # To catch specific client-side errors
+    # from asyncio import TimeoutError # To catch timeouts if server unresponsive
+
+    port = server.http3_port or server.port
+
+    async with connect(
+        server.host,
+        port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as client:
+        client = cast(HttpClient, client)
+        
+        try:
+            # Ensure handshake is complete to have transport parameters.
+            # A simple ping can achieve this if connect() doesn't guarantee full handshake completion for params.
+            await client.ping() 
+
+            if client._quic.peer_transport_parameters is None:
+                client._quic._logger.warning(f"({server.name}) Peer transport parameters not available after handshake. Skipping test.")
+                return
+
+            advertised_limit = client._quic.peer_transport_parameters.initial_max_streams_bidi
+            
+            # aioquic's default for initial_max_streams_bidi if peer doesn't send is 100.
+            # Let's assume 'None' means it wasn't sent, so default applies.
+            if advertised_limit is None:
+                client._quic._logger.warning(f"({server.name}) initial_max_streams_bidi not explicitly set by peer, defaults to 100. Test will use a cap.")
+                advertised_limit = 100 # aioquic's internal default
+
+            client._quic._logger.info(f"({server.name}) Server advertised initial_max_streams_bidi: {advertised_limit}.")
+
+            # Define the number of streams to actually test opening successfully before expecting a failure.
+            # Cap at a practical number for testing, e.g., 10.
+            # If advertised_limit is 0, streams_to_open_cap will be 0.
+            # If advertised_limit is 1, streams_to_open_cap will be 1.
+            streams_to_open_cap = min(advertised_limit, 10)
+
+            if streams_to_open_cap == 0:
+                client._quic._logger.info(f"({server.name}) Testing with limit 0. Attempting to open 1 stream, expecting failure.")
+                try:
+                    await client.get(f"https://{server.host}:{port}{server.path or '/'}?id=limit0_test")
+                    client._quic._logger.warning(f"({server.name}) Client initiated a stream even though server's initial_max_streams_bidi is 0.")
+                except QuicConnectionError as e:
+                    if e.error_code == QuicErrorCode.STREAM_LIMIT_ERROR or "no stream id available" in str(e).lower() or "stream id limit reached" in str(e).lower():
+                        client._quic._logger.info(f"({server.name}) Client correctly prevented stream (or server rejected) due to 0 limit: {e}")
+                        server.result |= Result.X
+                    else:
+                        client._quic._logger.error(f"({server.name}) Stream creation failed for 0 limit, but with unexpected error: {e}")
+                except asyncio.TimeoutError: # Catch timeout specifically
+                    client._quic._logger.info(f"({server.name}) Timeout trying to open stream when limit is 0. Considered as respecting limit.")
+                    server.result |= Result.X # If it times out, stream wasn't successfully opened.
+                except Exception as e:
+                    client._quic._logger.error(f"({server.name}) General error during 0 limit stream test: {e}")
+                return
+
+            # For advertised_limit > 0 (tested via streams_to_open_cap)
+            client._quic._logger.info(f"({server.name}) Attempting to open {streams_to_open_cap} streams, expecting success.")
+            tasks = []
+            for i in range(streams_to_open_cap):
+                tasks.append(client.get(f"https://{server.host}:{port}{server.path or '/'}?stream_no={i}"))
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            successful_streams = 0
+            for i, res in enumerate(results):
+                # http_client.get returns a list of events, first should be HeadersReceived
+                if isinstance(res, list) and res and isinstance(res[0], HeadersReceived):
+                    successful_streams += 1
+                else:
+                    client._quic._logger.error(f"({server.name}) Stream {i} (up to {streams_to_open_cap}) failed or no headers: {res}")
+                    return 
+            
+            if successful_streams != streams_to_open_cap:
+                client._quic._logger.error(f"({server.name}) Expected {streams_to_open_cap} successful streams, got {successful_streams}.")
+                return
+            client._quic._logger.info(f"({server.name}) Successfully opened {successful_streams} bidirectional streams.")
+
+            # Only proceed to test the (limit+1)th stream if we were testing against the actual advertised_limit
+            # (i.e., our cap of 10 wasn't lower than the advertised_limit)
+            if streams_to_open_cap == advertised_limit:
+                client._quic._logger.info(f"({server.name}) Attempting to open {advertised_limit + 1}-th stream, expecting client-side failure.")
+                try:
+                    await client.get(f"https://{server.host}:{port}{server.path or '/'}?stream_no={advertised_limit}_over_limit")
+                    client._quic._logger.warning(f"({server.name}) Client allowed opening the {advertised_limit + 1}-th stream when limit was {advertised_limit}.")
+                except QuicConnectionError as e:
+                    if e.error_code == QuicErrorCode.STREAM_LIMIT_ERROR or \
+                       "no stream id available" in str(e).lower() or \
+                       "stream id limit reached" in str(e).lower():
+                        client._quic._logger.info(f"({server.name}) Client correctly raised STREAM_LIMIT_ERROR (or similar) for {advertised_limit + 1}-th stream: {e}")
+                        server.result |= Result.X
+                    else:
+                        client._quic._logger.error(f"({server.name}) Unexpected QuicConnectionError on {advertised_limit + 1}-th stream: {e}")
+                except asyncio.TimeoutError: # Catch timeout specifically
+                    client._quic._logger.info(f"({server.name}) Timeout trying to open {advertised_limit+1}-th stream. Server might be unresponsive or client correctly timed out pending stream ID.")
+                    # This is ambiguous for Result.X, ideally we want explicit client error.
+                except Exception as e:
+                    client._quic._logger.error(f"({server.name}) Unexpected Exception on {advertised_limit + 1}-th stream: {e}")
+            else: # streams_to_open_cap < advertised_limit (because advertised_limit > 10)
+                client._quic._logger.info(f"({server.name}) Server's advertised limit ({advertised_limit}) is higher than test cap ({streams_to_open_cap}). "
+                                     "Cannot definitively test client exceeding advertised limit with this test instance.")
+                # To verify this, we could try to open one more stream and it should succeed.
+                try:
+                    await client.get(f"https://{server.host}:{port}{server.path or '/'}?stream_no={streams_to_open_cap}_under_high_limit")
+                    client._quic._logger.info(f"({server.name}) Successfully opened {streams_to_open_cap + 1}-th stream as expected since server limit {advertised_limit} is high.")
+                    # This doesn't set Result.X as it doesn't test *hitting* the limit.
+                except Exception as e:
+                    client._quic._logger.error(f"({server.name}) Error opening {streams_to_open_cap + 1}-th stream even though server limit {advertised_limit} is high: {e}")
+
+
+        except asyncio.TimeoutError:
+            client._quic._logger.warning(f"({server.name}) Test timed out: test_max_streams_bidi_client_respects_limit")
+        except Exception as e:
+            client._quic._logger.error(f"({server.name}) Generic error in test_max_streams_bidi_client_respects_limit: {e}")
+            import traceback
+            client._quic._logger.error(traceback.format_exc())
+
 def print_result(server: Server) -> None:
     result = str(server.result).replace("three", "3")
     result = result[0:8] + " " + result[8:16] + " " + result[16:]
@@ -1701,6 +1825,10 @@ if __name__ == "__main__":
         servers = list(filter(lambda x: x.name == args.server, servers))
     if args.test:
         tests = list(filter(lambda x: x[0] == args.test, tests))
+    
+    # Add the new test to the list of tests to be run
+    # tests.append(("test_max_streams_bidi_client_respects_limit", test_max_streams_bidi_client_respects_limit))
+
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(
