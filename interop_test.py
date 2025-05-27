@@ -24,7 +24,7 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.logger import QuicFileLogger, QuicLogger
 from aioquic.quic.connection import QuicConnectionError
 from aioquic.quic.packet import QuicErrorCode, PacketType
-from aioquic.quic.frames import NewConnectionIdFrame, RetireConnectionIdFrame, PathChallengeFrame
+from aioquic.quic.frame import NewConnectionIdFrame, RetireConnectionIdFrame, PathChallengeFrame
 import os
 
 
