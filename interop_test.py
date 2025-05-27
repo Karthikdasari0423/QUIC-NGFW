@@ -23,7 +23,7 @@ from aioquic.h3.events import DataReceived, HeadersReceived, PushPromiseReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.logger import QuicFileLogger, QuicLogger
 from aioquic.quic.connection import QuicConnectionError
-from aioquic.quic.packet import QuicErrorCode, PacketType
+from aioquic.quic.packet import QuicErrorCode, QuicPacketType
 from aioquic.quic.frame import NewConnectionIdFrame, RetireConnectionIdFrame, PathChallengeFrame
 import os
 
