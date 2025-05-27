@@ -1765,20 +1765,13 @@ async def test_max_streams_uni_client_respects_limit(server: Server, configurati
         try:
             await client.ping() # Ensure handshake is complete and H3 is established
 
-            if client._quic._peer_transport_parameters is None:
-                client._quic._logger.warning(f"({server.name}) Uni: Peer transport parameters not available. Skipping.")
-                return
+            # Fetch directly using _remote_max_streams_uni
+            advertised_limit_uni = client._quic._remote_max_streams_uni
+            
+            # The value of client._quic._remote_max_streams_uni will be 0 if the peer doesn't send the parameter.
+            # This is the desired behavior for the test logic that follows.
 
-            advertised_limit_uni = client._quic._peer_transport_parameters.initial_max_streams_uni
-            if advertised_limit_uni is None:
-                # If not sent, aioquic._quic_connection.QuicConnection.send_probe assumes a default of 100 for peer.
-                # For this test, if it's not advertised, we can't reliably test peer's specific limit.
-                # However, aioquic client itself might enforce its own default send limit if creating many.
-                # Let's assume for this test, if None, it's like a high limit (e.g., 100 from aioquic default).
-                client._quic._logger.warning(f"({server.name}) Uni: initial_max_streams_uni not explicitly set by peer, assuming default high (e.g., 100).")
-                advertised_limit_uni = 100 
-
-            client._quic._logger.info(f"({server.name}) Uni: Server advertised initial_max_streams_uni: {advertised_limit_uni}.")
+            client._quic._logger.info(f"({server.name}) Uni: Server advertised initial_max_streams_uni: {advertised_limit_uni} (0 means not sent or explicitly 0).")
 
             # H3 typically opens 3 unidirectional streams:
             # 1 for client control, 1 for QPACK encoder, 1 for QPACK decoder.
@@ -1911,11 +1904,7 @@ async def test_initial_max_data_client_respects_limit(server: Server, configurat
         try:
             await client.ping() # Ensure handshake is complete and H3 is established
 
-            if client._quic._peer_transport_parameters is None:
-                client._quic._logger.warning(f"({server.name}) MaxData: Peer transport parameters not available. Skipping.")
-                return
-
-            advertised_initial_max_data = client._quic._peer_transport_parameters.initial_max_data
+            advertised_initial_max_data = client._quic._remote_max_data
             
             if advertised_initial_max_data is None:
                 # If not specified by peer, QUIC spec implies a small limit (e.g. 16KB for some drafts)
