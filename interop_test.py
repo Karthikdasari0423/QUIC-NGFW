@@ -1765,11 +1765,11 @@ async def test_max_streams_uni_client_respects_limit(server: Server, configurati
         try:
             await client.ping() # Ensure handshake is complete and H3 is established
 
-            if client._quic.peer_transport_parameters is None:
+            if client._quic._peer_transport_parameters is None:
                 client._quic._logger.warning(f"({server.name}) Uni: Peer transport parameters not available. Skipping.")
                 return
 
-            advertised_limit_uni = client._quic.peer_transport_parameters.initial_max_streams_uni
+            advertised_limit_uni = client._quic._peer_transport_parameters.initial_max_streams_uni
             if advertised_limit_uni is None:
                 # If not sent, aioquic._quic_connection.QuicConnection.send_probe assumes a default of 100 for peer.
                 # For this test, if it's not advertised, we can't reliably test peer's specific limit.
@@ -1911,11 +1911,11 @@ async def test_initial_max_data_client_respects_limit(server: Server, configurat
         try:
             await client.ping() # Ensure handshake is complete and H3 is established
 
-            if client._quic.peer_transport_parameters is None:
+            if client._quic._peer_transport_parameters is None:
                 client._quic._logger.warning(f"({server.name}) MaxData: Peer transport parameters not available. Skipping.")
                 return
 
-            advertised_initial_max_data = client._quic.peer_transport_parameters.initial_max_data
+            advertised_initial_max_data = client._quic._peer_transport_parameters.initial_max_data
             
             if advertised_initial_max_data is None:
                 # If not specified by peer, QUIC spec implies a small limit (e.g. 16KB for some drafts)
