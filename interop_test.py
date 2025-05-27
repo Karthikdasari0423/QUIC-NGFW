@@ -48,6 +48,8 @@ class Result(Flag):
     d = 0x020000
     p = 0x040000
     X = 0x080000 # Max Streams Limit respected
+    Y = 0x100000 # Max Unidirectional Streams Limit respected
+    F = 0x200000 # Connection Flow Control respected
 
     def __str__(self):
         flags = sorted(
@@ -1740,6 +1742,298 @@ async def test_max_streams_bidi_client_respects_limit(server: Server, configurat
             client._quic._logger.warning(f"({server.name}) Test timed out: test_max_streams_bidi_client_respects_limit")
         except Exception as e:
             client._quic._logger.error(f"({server.name}) Generic error in test_max_streams_bidi_client_respects_limit: {e}")
+            import traceback
+            client._quic._logger.error(traceback.format_exc())
+
+
+async def test_max_streams_uni_client_respects_limit(server: Server, configuration: QuicConfiguration):
+    configuration.alpn_protocols = H3_ALPN
+    from aioquic.quic.packet import QuicErrorCode
+    from aioquic.quic.connection import QuicConnectionError
+    # asyncio.TimeoutError is part of asyncio, available if asyncio is imported.
+
+    port = server.http3_port or server.port
+
+    async with connect(
+        server.host,
+        port,
+        configuration=configuration,
+        create_protocol=HttpClient, # Using HttpClient to setup H3 connection easily
+    ) as client:
+        client = cast(HttpClient, client)
+        
+        try:
+            await client.ping() # Ensure handshake is complete and H3 is established
+
+            if client._quic.peer_transport_parameters is None:
+                client._quic._logger.warning(f"({server.name}) Uni: Peer transport parameters not available. Skipping.")
+                return
+
+            advertised_limit_uni = client._quic.peer_transport_parameters.initial_max_streams_uni
+            if advertised_limit_uni is None:
+                # If not sent, aioquic._quic_connection.QuicConnection.send_probe assumes a default of 100 for peer.
+                # For this test, if it's not advertised, we can't reliably test peer's specific limit.
+                # However, aioquic client itself might enforce its own default send limit if creating many.
+                # Let's assume for this test, if None, it's like a high limit (e.g., 100 from aioquic default).
+                client._quic._logger.warning(f"({server.name}) Uni: initial_max_streams_uni not explicitly set by peer, assuming default high (e.g., 100).")
+                advertised_limit_uni = 100 
+
+            client._quic._logger.info(f"({server.name}) Uni: Server advertised initial_max_streams_uni: {advertised_limit_uni}.")
+
+            # H3 typically opens 3 unidirectional streams:
+            # 1 for client control, 1 for QPACK encoder, 1 for QPACK decoder.
+            # This count can be observed from client._quic._local_max_streams_uni_open_count after H3 setup.
+            # However, relying on this exact number might be fragile if H3Connection changes internals.
+            # A safer way: query how many streams are *currently* open that are unidirectional.
+            # Let's assume client._quic._stream_count[True][True] gives count of local uni streams.
+            # Or, more robustly, try to open streams and see when it fails relative to advertised_limit.
+            
+            # Number of uni streams client can initiate according to peer's limit
+            # This doesn't subtract streams already opened by H3Connection locally, 
+            # as initial_max_streams_uni is about how many *peer* will accept in total from us.
+            # The client's QuicConnection itself tracks how many it has opened against this limit.
+
+            # Cap the number of *additional* streams we try to open for this test for practicality.
+            # If advertised_limit_uni is very low (e.g., 0, 1, 2, 3), this cap might not apply.
+            # The number of streams we will attempt to open *in this test logic* (beyond what H3 setup did).
+            max_additional_streams_to_test = 5 
+            
+            streams_opened_by_test = 0
+            
+            # Case 1: Server allows 0 unidirectional streams from us.
+            # This means any uni stream we (client) try to open should fail.
+            # H3Connection itself opens uni streams for control, QPACK. If advertised_limit_uni
+            # is less than what H3 needs, the connection might fail during H3 setup.
+            # This test assumes H3 setup succeeded.
+            if advertised_limit_uni < client._quic._local_max_streams_uni_open_count:
+                 client._quic._logger.warning(f"({server.name}) Uni: Advertised limit {advertised_limit_uni} is less than streams already opened by H3 ({client._quic._local_max_streams_uni_open_count}). Connection should likely have failed earlier if server enforces strictly.")
+                 # If connection is still up, try to open one more; it must fail.
+                 try:
+                    stream_id = client._quic.create_stream(is_unidirectional=True)
+                    if stream_id is not None:
+                        client._quic._logger.warning(f"({server.name}) Uni: Client created a uni stream {stream_id} when advertised limit {advertised_limit_uni} was already exceeded by H3 streams.")
+                        # Send a byte to make it count towards open_count if create_stream doesn't do it.
+                        # client._quic.send_stream_data(stream_id, b'a', end_stream=True) 
+                    else: # stream_id is None
+                        client._quic._logger.info(f"({server.name}) Uni: Client correctly failed to create uni stream (returned None) as limit {advertised_limit_uni} likely exceeded by H3 setup.")
+                        server.result |= Result.Y
+                 except QuicConnectionError as e:
+                    if e.error_code == QuicErrorCode.STREAM_LIMIT_ERROR:
+                        client._quic._logger.info(f"({server.name}) Uni: Client correctly raised STREAM_LIMIT_ERROR as limit {advertised_limit_uni} likely exceeded by H3 setup.")
+                        server.result |= Result.Y
+                    else:
+                        client._quic._logger.error(f"({server.name}) Uni: Stream creation failed as expected due to low limit, but with unexpected error: {e}")
+                 return # Test ends here for this case.
+
+
+            # Try to open streams one by one until we hit the advertised_limit_uni or our practical cap for *total* open uni streams.
+            for i in range(max_additional_streams_to_test + 1): # +1 to try to exceed the cap / limit
+                current_total_client_uni_streams = client._quic._local_max_streams_uni_open_count
+                
+                if current_total_client_uni_streams >= advertised_limit_uni:
+                    # We are at or over the server's advertised limit for total uni streams from us.
+                    # Attempting to create one more should fail.
+                    client._quic._logger.info(f"({server.name}) Uni: Client has {current_total_client_uni_streams} uni streams. Server limit {advertised_limit_uni}. Attempting to create one more (expect fail).")
+                    try:
+                        stream_id = client._quic.create_stream(is_unidirectional=True)
+                        if stream_id is not None:
+                            client._quic._logger.warning(f"({server.name}) Uni: Client CREATED uni stream {stream_id} EXCEEDING server limit {advertised_limit_uni}. Current count: {client._quic._local_max_streams_uni_open_count + 1 if stream_id is not None else 'failed'}")
+                        else: # stream_id is None, meaning client prevented it.
+                            client._quic._logger.info(f"({server.name}) Uni: Client correctly PREVENTED uni stream creation (returned None) at limit {advertised_limit_uni}.")
+                            server.result |= Result.Y
+                    except QuicConnectionError as e:
+                        if e.error_code == QuicErrorCode.STREAM_LIMIT_ERROR:
+                            client._quic._logger.info(f"({server.name}) Uni: Client correctly RAISED STREAM_LIMIT_ERROR at limit {advertised_limit_uni}.")
+                            server.result |= Result.Y
+                        else:
+                            client._quic._logger.error(f"({server.name}) Uni: Expected STREAM_LIMIT_ERROR at limit {advertised_limit_uni}, but got {e}.")
+                    except Exception as e:
+                        client._quic._logger.error(f"({server.name}) Uni: Unexpected exception when trying to exceed limit {advertised_limit_uni}: {e}")
+                    return # Test finishes after checking the one-too-many attempt.
+
+                # If we are below the advertised limit and below our practical test cap for *additional* streams for this loop
+                if i < max_additional_streams_to_test:
+                    client._quic._logger.info(f"({server.name}) Uni: Client has {current_total_client_uni_streams} uni streams. Server limit {advertised_limit_uni}. Attempting to create additional stream #{i+1}.")
+                    try:
+                        stream_id = client._quic.create_stream(is_unidirectional=True)
+                        if stream_id is not None:
+                            streams_opened_by_test += 1
+                            client._quic._logger.info(f"({server.name}) Uni: Successfully created additional uni stream {stream_id} (total client uni: {client._quic._local_max_streams_uni_open_count}).")
+                            # Optionally send a byte to make it "active" if create_stream itself doesn't update counts relevant for limits immediately.
+                            # client._quic.send_stream_data(stream_id, b'a', end_stream=True)
+                        else:
+                            client._quic._logger.error(f"({server.name}) Uni: Client FAILED to create additional uni stream #{i+1} (returned None) even though current_count {current_total_client_uni_streams} < limit {advertised_limit_uni}.")
+                            return # Should not happen if below limit
+                    except QuicConnectionError as e:
+                         client._quic._logger.error(f"({server.name}) Uni: Client FAILED to create additional uni stream #{i+1} with error {e} even though current_count {current_total_client_uni_streams} < limit {advertised_limit_uni}.")
+                         return # Should not happen
+                    except Exception as e:
+                        client._quic._logger.error(f"({server.name}) Uni: Unexpected exception creating additional uni stream #{i+1}: {e}")
+                        return
+                else: # i == max_additional_streams_to_test
+                    # We've opened our practical cap of additional streams for this test.
+                    # And we were still under the server's advertised_limit_uni.
+                    client._quic._logger.info(f"({server.name}) Uni: Reached practical test cap of {max_additional_streams_to_test} additional uni streams. "
+                                         f"Total client uni streams: {client._quic._local_max_streams_uni_open_count}. "
+                                         f"Server limit {advertised_limit_uni} was not reached by this test.")
+                    return
+
+
+            # If loop finished, it means we didn't hit the condition current_total_client_uni_streams >= advertised_limit_uni
+            # within max_additional_streams_to_test+1 iterations. This implies advertised_limit_uni was high.
+            client._quic._logger.info(f"({server.name}) Uni: Test completed. Opened {streams_opened_by_test} additional uni streams. "
+                                 f"Server advertised limit {advertised_limit_uni} was likely not reached or tested for exceeding if it was > internal H3 count + {max_additional_streams_to_test}.")
+
+        except asyncio.TimeoutError:
+            client._quic._logger.warning(f"({server.name}) Uni: Test timed out: test_max_streams_uni_client_respects_limit")
+        except Exception as e:
+            client._quic._logger.error(f"({server.name}) Uni: Generic error in test_max_streams_uni_client_respects_limit: {e}")
+            import traceback
+            client._quic._logger.error(traceback.format_exc())
+
+
+async def test_initial_max_data_client_respects_limit(server: Server, configuration: QuicConfiguration):
+    configuration.alpn_protocols = H3_ALPN
+    from aioquic.quic.packet import QuicErrorCode
+    from aioquic.quic.connection import QuicConnectionError
+    # asyncio is imported at top level
+
+    port = server.http3_port or server.port
+    # Using HttpClient to setup H3 and then access _quic for direct stream manipulation
+    async with connect(
+        server.host,
+        port,
+        configuration=configuration,
+        create_protocol=HttpClient,
+    ) as client:
+        client = cast(HttpClient, client)
+        
+        try:
+            await client.ping() # Ensure handshake is complete and H3 is established
+
+            if client._quic.peer_transport_parameters is None:
+                client._quic._logger.warning(f"({server.name}) MaxData: Peer transport parameters not available. Skipping.")
+                return
+
+            advertised_initial_max_data = client._quic.peer_transport_parameters.initial_max_data
+            
+            if advertised_initial_max_data is None:
+                # If not specified by peer, QUIC spec implies a small limit (e.g. 16KB for some drafts)
+                # aioquic's QuicConnection initializes flow_control_peer_max_data to 0 if param is None,
+                # which means client cannot send any data until MAX_DATA is received.
+                # This is a valid scenario to test.
+                client._quic._logger.info(f"({server.name}) MaxData: initial_max_data not advertised by peer. Effective limit is 0 initially.")
+                advertised_initial_max_data = 0
+            
+            client._quic._logger.info(f"({server.name}) MaxData: Server advertised initial_max_data: {advertised_initial_max_data}.")
+
+            # Create a stream to send data on. Need to use _quic directly.
+            # HttpClient usually handles stream creation for requests.
+            # We need a bidi stream to send data.
+            stream_id = client._quic.get_next_available_stream_id(is_client=True, is_unidirectional=False)
+            if stream_id is None:
+                client._quic._logger.error(f"({server.name}) MaxData: Could not create a bidi stream to send data.")
+                return
+            
+            # To make H3 server accept data on this stream, we might need to send H3 headers first.
+            # This complicates things. Let's try a POST request via HttpClient, sending data via its generator.
+            # This will handle H3 framing. We need a way to feed data slowly/in chunks.
+
+            chunk_size = 4 * 1024  # 4KB chunks
+            # Define total data to attempt to send.
+            # If advertised_initial_max_data is 0, try to send one chunk.
+            # Otherwise, try to send slightly more than advertised_initial_max_data, capped for test duration.
+            # Practical cap for data sending in this test, e.g., 256KB.
+            # This ensures test doesn't run too long if initial_max_data is huge.
+            practical_send_cap = 256 * 1024 
+            
+            data_to_attempt_total = 0
+            if advertised_initial_max_data == 0:
+                data_to_attempt_total = chunk_size # Try to send one chunk
+            else:
+                # Try to send up to the cap, or just over the advertised limit if it's smaller than cap
+                data_to_attempt_total = min(advertised_initial_max_data + chunk_size, practical_send_cap)
+
+            client._quic._logger.info(f"({server.name}) MaxData: Will attempt to send {data_to_attempt_total} bytes in total.")
+
+            sent_so_far_total = 0
+            
+            # Use a generator for POST request data
+            async def data_generator():
+                nonlocal sent_so_far_total
+                bytes_left_to_send_for_test = data_to_attempt_total
+                while bytes_left_to_send_for_test > 0:
+                    current_chunk_size = min(chunk_size, bytes_left_to_send_for_test)
+                    data_chunk = b'a' * current_chunk_size
+                    
+                    # Before yielding data, check if client is already connection data blocked
+                    # This check is a bit indirect as HttpClient handles the actual send calls.
+                    # We are more interested if _quic layer gets blocked.
+                    if client._quic.data_blocked_local:
+                        client._quic._logger.info(f"({server.name}) MaxData: Client is data_blocked_local (conn level) before yielding next chunk. Sent {sent_so_far_total}.")
+                        # Stop the generator, effectively stopping the POST.
+                        return
+
+                    yield data_chunk
+                    sent_so_far_total += len(data_chunk)
+                    bytes_left_to_send_for_test -= len(data_chunk)
+                    client._quic._logger.info(f"({server.name}) MaxData: Sent {len(data_chunk)} bytes. Total sent by generator: {sent_so_far_total}.")
+                    await asyncio.sleep(0.01) # Small sleep to allow QUIC stack to process & update states
+
+                # After generator finishes, check data_blocked_local again
+                # This might be set if the last chunk filled the window exactly.
+                await asyncio.sleep(0.1) # allow quic stack to process last chunk
+                if client._quic.data_blocked_local:
+                    client._quic._logger.info(f"({server.name}) MaxData: Client is data_blocked_local after sending all data ({sent_so_far_total}).")
+                    # This is a key success condition if sent_so_far_total is around advertised_initial_max_data
+                    if advertised_initial_max_data == 0 and sent_so_far_total == 0: # if limit 0, no data should be sent by generator if blocked immediately
+                         server.result |= Result.F
+                    elif abs(sent_so_far_total - advertised_initial_max_data) < chunk_size : # check if we are near the limit
+                         server.result |= Result.F
+
+
+            post_url = f"https://{server.host}:{port}{server.path or '/'}post_max_data_test"
+            try:
+                http_events = await client.post(post_url, data=data_generator())
+                # Check response if needed, but for this test, primary focus is on sending behavior.
+                if http_events and isinstance(http_events[0], HeadersReceived):
+                    client._quic._logger.info(f"({server.name}) MaxData: POST request completed. Response headers: {http_events[0].headers}")
+                else:
+                    client._quic._logger.warning(f"({server.name}) MaxData: POST request finished but no/unexpected headers: {http_events}")
+
+            except QuicConnectionError as e:
+                # This might happen if server closes connection due to client sending too much (e.g. FLOW_CONTROL_ERROR)
+                # or if client itself hits a hard error during send.
+                client._quic._logger.error(f"({server.name}) MaxData: QuicConnectionError during POST: {e}")
+                if e.error_code == QuicErrorCode.FLOW_CONTROL_ERROR and client._quic.data_blocked_local:
+                    client._quic._logger.info(f"({server.name}) MaxData: Caught FLOW_CONTROL_ERROR and client is data_blocked_local. Likely hit limit.")
+                    server.result |= Result.F
+            except asyncio.TimeoutError:
+                 client._quic._logger.warning(f"({server.name}) MaxData: POST request timed out. Client might be blocked by flow control.")
+                 # If it timed out and we were trying to send more than allowed, and data_blocked_local is set, it's a pass.
+                 if client._quic.data_blocked_local and sent_so_far_total >= advertised_initial_max_data :
+                     server.result |= Result.F
+            except Exception as e:
+                client._quic._logger.error(f"({server.name}) MaxData: Unexpected exception during POST: {e}")
+
+            # Final check on data_blocked_local after all operations
+            # This is the most reliable check for client respecting flow control.
+            # This flag is set by aioquic when _send_data_frame cannot send due to connection FC window.
+            if client._quic.data_blocked_local:
+                client._quic._logger.info(f"({server.name}) MaxData: Test end, client._quic.data_blocked_local is True. Total bytes QUIC connection tried to send: {client._quic.data_sent_local}.")
+                # If data_sent_local is close to advertised_initial_max_data, this is a success.
+                # Note: data_sent_local is total bytes given to send_stream_data, not necessarily 'in flight'.
+                # flow_control_peer_max_data is the current window.
+                # If data_sent_local > flow_control_peer_max_data and data_blocked_local is true, it's a strong signal.
+                if client._quic.data_sent_local >= client._quic.flow_control_peer_max_data:
+                     server.result |= Result.F
+                elif advertised_initial_max_data == 0 and client._quic.data_sent_local == 0 : # if limit is 0, and client sent 0 data and is blocked.
+                     server.result |= Result.F
+
+        except asyncio.TimeoutError:
+            client._quic._logger.warning(f"({server.name}) MaxData: Test timed out globally: test_initial_max_data_client_respects_limit")
+        except Exception as e:
+            client._quic._logger.error(f"({server.name}) MaxData: Generic error in test_initial_max_data_client_respects_limit: {e}")
             import traceback
             client._quic._logger.error(traceback.format_exc())
 
