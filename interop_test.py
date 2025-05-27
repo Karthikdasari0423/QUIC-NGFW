@@ -1775,11 +1775,7 @@ async def test_max_streams_uni_client_respects_limit(server: Server, configurati
 
             # H3 typically opens 3 unidirectional streams:
             # 1 for client control, 1 for QPACK encoder, 1 for QPACK decoder.
-            # This count can be observed from client._quic._local_max_streams_uni_open_count after H3 setup.
-            # However, relying on this exact number might be fragile if H3Connection changes internals.
-            # A safer way: query how many streams are *currently* open that are unidirectional.
-            # Let's assume client._quic._stream_count[True][True] gives count of local uni streams.
-            # Or, more robustly, try to open streams and see when it fails relative to advertised_limit.
+            # The number of locally initiated uni streams is (client._quic._local_next_stream_id_uni - 2) // 4
             
             # Number of uni streams client can initiate according to peer's limit
             # This doesn't subtract streams already opened by H3Connection locally, 
@@ -1793,26 +1789,24 @@ async def test_max_streams_uni_client_respects_limit(server: Server, configurati
             
             streams_opened_by_test = 0
             
-            # Case 1: Server allows 0 unidirectional streams from us.
-            # This means any uni stream we (client) try to open should fail.
-            # H3Connection itself opens uni streams for control, QPACK. If advertised_limit_uni
-            # is less than what H3 needs, the connection might fail during H3 setup.
-            # This test assumes H3 setup succeeded.
-            if advertised_limit_uni < client._quic._local_max_streams_uni_open_count:
-                 client._quic._logger.warning(f"({server.name}) Uni: Advertised limit {advertised_limit_uni} is less than streams already opened by H3 ({client._quic._local_max_streams_uni_open_count}). Connection should likely have failed earlier if server enforces strictly.")
+            initial_client_opened_uni_count = (client._quic._local_next_stream_id_uni - 2) // 4
+            client._quic._logger.info(f"({server.name}) Uni: Initial client uni streams (opened by H3): {initial_client_opened_uni_count}")
+
+            # Case 1: Server allows 0 unidirectional streams from us, or fewer than H3 needs.
+            # This means any *additional* uni stream we (client) try to open should fail.
+            if advertised_limit_uni < initial_client_opened_uni_count:
+                 client._quic._logger.warning(f"({server.name}) Uni: Advertised limit {advertised_limit_uni} is less than streams already opened by H3 ({initial_client_opened_uni_count}). Connection should likely have failed earlier if server enforces strictly, or client should prevent opening more.")
                  # If connection is still up, try to open one more; it must fail.
                  try:
                     stream_id = client._quic.create_stream(is_unidirectional=True)
                     if stream_id is not None:
-                        client._quic._logger.warning(f"({server.name}) Uni: Client created a uni stream {stream_id} when advertised limit {advertised_limit_uni} was already exceeded by H3 streams.")
-                        # Send a byte to make it count towards open_count if create_stream doesn't do it.
-                        # client._quic.send_stream_data(stream_id, b'a', end_stream=True) 
+                        client._quic._logger.warning(f"({server.name}) Uni: Client created a uni stream {stream_id} when advertised limit {advertised_limit_uni} was already exceeded by H3 streams ({initial_client_opened_uni_count}).")
                     else: # stream_id is None
-                        client._quic._logger.info(f"({server.name}) Uni: Client correctly failed to create uni stream (returned None) as limit {advertised_limit_uni} likely exceeded by H3 setup.")
+                        client._quic._logger.info(f"({server.name}) Uni: Client correctly failed to create uni stream (returned None) as limit {advertised_limit_uni} likely exceeded by H3 setup ({initial_client_opened_uni_count}).")
                         server.result |= Result.Y
                  except QuicConnectionError as e:
                     if e.error_code == QuicErrorCode.STREAM_LIMIT_ERROR:
-                        client._quic._logger.info(f"({server.name}) Uni: Client correctly raised STREAM_LIMIT_ERROR as limit {advertised_limit_uni} likely exceeded by H3 setup.")
+                        client._quic._logger.info(f"({server.name}) Uni: Client correctly raised STREAM_LIMIT_ERROR as limit {advertised_limit_uni} likely exceeded by H3 setup ({initial_client_opened_uni_count}).")
                         server.result |= Result.Y
                     else:
                         client._quic._logger.error(f"({server.name}) Uni: Stream creation failed as expected due to low limit, but with unexpected error: {e}")
@@ -1821,7 +1815,7 @@ async def test_max_streams_uni_client_respects_limit(server: Server, configurati
 
             # Try to open streams one by one until we hit the advertised_limit_uni or our practical cap for *total* open uni streams.
             for i in range(max_additional_streams_to_test + 1): # +1 to try to exceed the cap / limit
-                current_total_client_uni_streams = client._quic._local_max_streams_uni_open_count
+                current_total_client_uni_streams = (client._quic._local_next_stream_id_uni - 2) // 4
                 
                 if current_total_client_uni_streams >= advertised_limit_uni:
                     # We are at or over the server's advertised limit for total uni streams from us.
@@ -1829,9 +1823,10 @@ async def test_max_streams_uni_client_respects_limit(server: Server, configurati
                     client._quic._logger.info(f"({server.name}) Uni: Client has {current_total_client_uni_streams} uni streams. Server limit {advertised_limit_uni}. Attempting to create one more (expect fail).")
                     try:
                         stream_id = client._quic.create_stream(is_unidirectional=True)
-                        if stream_id is not None:
-                            client._quic._logger.warning(f"({server.name}) Uni: Client CREATED uni stream {stream_id} EXCEEDING server limit {advertised_limit_uni}. Current count: {client._quic._local_max_streams_uni_open_count + 1 if stream_id is not None else 'failed'}")
-                        else: # stream_id is None, meaning client prevented it.
+                        if stream_id is not None: # Stream creation succeeded unexpectedly
+                            final_count = (client._quic._local_next_stream_id_uni - 2) // 4
+                            client._quic._logger.warning(f"({server.name}) Uni: Client CREATED uni stream {stream_id} EXCEEDING server limit {advertised_limit_uni}. Current total client uni streams: {final_count}")
+                        else: # stream_id is None, meaning client prevented it. This is correct.
                             client._quic._logger.info(f"({server.name}) Uni: Client correctly PREVENTED uni stream creation (returned None) at limit {advertised_limit_uni}.")
                             server.result |= Result.Y
                     except QuicConnectionError as e:
@@ -1851,9 +1846,9 @@ async def test_max_streams_uni_client_respects_limit(server: Server, configurati
                         stream_id = client._quic.create_stream(is_unidirectional=True)
                         if stream_id is not None:
                             streams_opened_by_test += 1
-                            client._quic._logger.info(f"({server.name}) Uni: Successfully created additional uni stream {stream_id} (total client uni: {client._quic._local_max_streams_uni_open_count}).")
-                            # Optionally send a byte to make it "active" if create_stream itself doesn't update counts relevant for limits immediately.
-                            # client._quic.send_stream_data(stream_id, b'a', end_stream=True)
+                            # Log new count after successful creation
+                            new_total_client_uni_streams = (client._quic._local_next_stream_id_uni - 2) // 4
+                            client._quic._logger.info(f"({server.name}) Uni: Successfully created additional uni stream {stream_id} (total client uni: {new_total_client_uni_streams}).")
                         else:
                             client._quic._logger.error(f"({server.name}) Uni: Client FAILED to create additional uni stream #{i+1} (returned None) even though current_count {current_total_client_uni_streams} < limit {advertised_limit_uni}.")
                             return # Should not happen if below limit
@@ -1866,16 +1861,19 @@ async def test_max_streams_uni_client_respects_limit(server: Server, configurati
                 else: # i == max_additional_streams_to_test
                     # We've opened our practical cap of additional streams for this test.
                     # And we were still under the server's advertised_limit_uni.
+                    final_total_client_uni_streams = (client._quic._local_next_stream_id_uni - 2) // 4
                     client._quic._logger.info(f"({server.name}) Uni: Reached practical test cap of {max_additional_streams_to_test} additional uni streams. "
-                                         f"Total client uni streams: {client._quic._local_max_streams_uni_open_count}. "
+                                         f"Total client uni streams: {final_total_client_uni_streams}. "
                                          f"Server limit {advertised_limit_uni} was not reached by this test.")
                     return
 
 
             # If loop finished, it means we didn't hit the condition current_total_client_uni_streams >= advertised_limit_uni
             # within max_additional_streams_to_test+1 iterations. This implies advertised_limit_uni was high.
+            final_loop_total_client_uni_streams = (client._quic._local_next_stream_id_uni - 2) // 4
             client._quic._logger.info(f"({server.name}) Uni: Test completed. Opened {streams_opened_by_test} additional uni streams. "
-                                 f"Server advertised limit {advertised_limit_uni} was likely not reached or tested for exceeding if it was > internal H3 count + {max_additional_streams_to_test}.")
+                                 f"Server advertised limit {advertised_limit_uni} was likely not reached or tested for exceeding if it was > internal H3 count ({initial_client_opened_uni_count}) + {max_additional_streams_to_test}. "
+                                 f"Final client uni stream count: {final_loop_total_client_uni_streams}.")
 
         except asyncio.TimeoutError:
             client._quic._logger.warning(f"({server.name}) Uni: Test timed out: test_max_streams_uni_client_respects_limit")
