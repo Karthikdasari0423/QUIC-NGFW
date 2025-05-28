@@ -1649,7 +1649,7 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
             server.result |= Result.M # Mark as success for respecting zero limit
             return
 
-        opened_streams_count = 0
+        streams_actually_opened_and_tested_count = 0
         for i in range(int(max_uni_streams_server_limit) + 5): # Try to open a few more than the limit
             # Client-initiated unidirectional stream IDs are 2, 6, 10, 14, ... (0x02, 0x06, 0x0A, 0x0E)
             # stream_id = 4 * i + 2 # This was an error in my previous thinking, stream IDs are not created by http client like this.
@@ -1686,12 +1686,12 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
                     stream = quic_conn._get_or_create_stream_for_send(stream_id_to_create)
                     if stream:
                         print(f"Successfully opened unidirectional stream ID: {stream_id_to_create}")
-                        opened_streams_count += 1
                         # Send a small amount of data
                         quic_conn.send_stream_data(stream_id_to_create, b"hello uni stream", end_stream=False) # Send some data
                         # Reset the stream (as per requirement, though closing might also be an option)
                         quic_conn.reset_stream(stream_id_to_create, error_code=ErrorCode.H3_NO_ERROR) # Using H3 error code
                         print(f"Sent data and reset stream ID: {stream_id_to_create}")
+                        streams_actually_opened_and_tested_count += 1
                     else:
                         # This case should ideally not happen if the check above is correct
                         print(f"Failed to open stream {stream_id_to_create} despite being under limit.")
@@ -1701,20 +1701,19 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
                     # This might happen if server rejects it for reasons other than count (e.g. ID exhaustion if many resets)
                     break
             else: # This branch is taken when opened_uni_streams >= quic_conn._remote_max_streams_uni
-                print(f"Reached server's unidirectional stream limit ({quic_conn._remote_max_streams_uni}). "
-                      f"Successfully opened and tested {opened_streams_count} streams before reaching limit.")
+                print(f"Reached server's unidirectional stream limit ({quic_conn._remote_max_streams_uni}). Successfully opened and tested {streams_actually_opened_and_tested_count} streams before reaching limit.")
                 server.result |= Result.M # Mark as success for respecting the limit
                 return # Test successful
 
         # This part is reached if the loop finishes for other reasons (e.g. 'i' runs out or an exception occurred)
-        # opened_streams_count here reflects the number of streams successfully processed.
-        if opened_streams_count == quic_conn._remote_max_streams_uni:
-            print(f"Successfully opened and tested all {opened_streams_count} (expected {quic_conn._remote_max_streams_uni}) unidirectional streams.")
+        # streams_actually_opened_and_tested_count here reflects the number of streams successfully processed.
+        if streams_actually_opened_and_tested_count == quic_conn._remote_max_streams_uni:
+            print(f"Successfully opened and tested all {streams_actually_opened_and_tested_count} (expected {quic_conn._remote_max_streams_uni}) unidirectional streams.")
             server.result |= Result.M
-        elif opened_streams_count < quic_conn._remote_max_streams_uni :
+        elif streams_actually_opened_and_tested_count < quic_conn._remote_max_streams_uni :
             # This means the loop completed (e.g. range limit hit or exception) before reaching the server's stream capacity.
             # This is not necessarily an error, as long as the limit was respected.
-            print(f"Loop finished. Successfully opened and tested {opened_streams_count} out of {quic_conn._remote_max_streams_uni} possible unidirectional streams. Limit was respected.")
+            print(f"Loop finished. Successfully opened and tested {streams_actually_opened_and_tested_count} out of {quic_conn._remote_max_streams_uni} possible unidirectional streams. Limit was respected.")
             # Potentially still a pass if no error occurred and we just didn't hit the +5 in the loop range.
             # Or could be a fail if an unexpected error broke the loop.
             # For now, let's assume if no exception broke it, and we didn't exceed, it's a form of pass.
@@ -1725,7 +1724,7 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
         else:
             # This case (opened_streams_count > max_uni_streams_server_limit) should not be reached
             # due to the check `opened_uni_streams < quic_conn._remote_max_streams_uni`.
-            print(f"Error: Opened {opened_streams_count} streams, which is more than the limit {quic_conn._remote_max_streams_uni}.")
+            print(f"Error: Opened {streams_actually_opened_and_tested_count} streams, which is more than the limit {quic_conn._remote_max_streams_uni}.")
             # This would be a test failure, so don't set Result.M
 
 def print_result(server: Server) -> None:
