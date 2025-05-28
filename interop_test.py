@@ -1661,11 +1661,14 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
             # e.g. by sending a unidirectional datagram or other uni-specific action if H3 supported it directly.
             # The prompt asks to use _get_or_create_stream_for_send.
             # Client-initiated unidirectional stream IDs start at 2 and increment by 4.
-            current_stream_id = 2 + (4 * quic_conn._streams_uni_opened) # This is not quite right, _streams_uni_opened is just a counter.
-                                                                       # We need get_next_available_stream_id but for uni.
-                                                                       # Let's use a simpler approach: try to open until limit.
+            # Calculate the number of currently opened client-initiated unidirectional streams.
+            # Client uni streams are 2, 6, 10, ... -> ID = 4*N + 2. So N = (ID - 2) / 4.
+            # _local_next_stream_id_uni gives the ID for the *next* stream to be opened.
+            # So, the number of *already opened* streams is ((_local_next_stream_id_uni - 2) // 4).
+            opened_uni_streams = (quic_conn._local_next_stream_id_uni - 2) // 4
+            print(f"Calculated opened unidirectional streams: {opened_uni_streams}, next local uni stream id: {quic_conn._local_next_stream_id_uni}")
 
-            if quic_conn._streams_uni_opened < quic_conn._remote_max_streams_uni:
+            if opened_uni_streams < quic_conn._remote_max_streams_uni:
                 # Generate the *next* client-initiated unidirectional stream ID
                 # The stream type for client-initiated unidirectional is 0x02.
                 # Stream IDs are like: 2, 6, 10, 14, ...
@@ -1674,9 +1677,9 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
                 # We need to calculate it based on how many uni streams are already open.
                 # Correct stream_id for client-initiated unidirectional: 2, 6, 10, ...
                 # The next available stream_id for a client initiated unidirectional stream
-                stream_id_to_create = quic_conn.get_next_available_stream_id(is_unidirectional=True)
+                stream_id_to_create = quic_conn.get_next_available_stream_id(is_unidirectional=True) # This correctly gets the next ID like 2, 6, 10
 
-                print(f"Attempting to open unidirectional stream ID: {stream_id_to_create} ({quic_conn._streams_uni_opened + 1}/{quic_conn._remote_max_streams_uni})")
+                print(f"Attempting to open unidirectional stream ID: {stream_id_to_create} (opened: {opened_uni_streams}, limit: {quic_conn._remote_max_streams_uni})")
                 try:
                     # This method creates if not exists, and is for sending.
                     # For uni streams, usually you'd write to it.
@@ -1717,7 +1720,7 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
             server.result |= Result.M # Pass if we respected limit, even if not all opened due to other reasons
         else:
             # This case (opened_streams_count > max_uni_streams_server_limit) should not be reached
-            # due to the check `quic_conn._streams_uni_opened < quic_conn._remote_max_streams_uni`.
+            # due to the check `opened_uni_streams < quic_conn._remote_max_streams_uni`.
             print(f"Error: Opened {opened_streams_count} streams, which is more than the limit {quic_conn._remote_max_streams_uni}.")
             # This would be a test failure, so don't set Result.M
 
