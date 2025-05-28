@@ -1641,8 +1641,8 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
         quic_conn = client._quic
 
         # Log the server's advertised limit
-        max_uni_streams_server_limit = quic_conn.remote_max_streams_uni
-        print(f"Server {server.name} advertised remote_max_streams_uni: {max_uni_streams_server_limit}")
+        max_uni_streams_server_limit = quic_conn._peer_transport_parameters.initial_max_streams_uni
+        print(f"Server {server.name} advertised initial_max_streams_uni: {max_uni_streams_server_limit}")
 
         if max_uni_streams_server_limit == 0:
             print(f"Server {server.name} does not allow any unidirectional streams. Test concludes by respecting this.")
@@ -1665,7 +1665,7 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
                                                                        # We need get_next_available_stream_id but for uni.
                                                                        # Let's use a simpler approach: try to open until limit.
 
-            if quic_conn._streams_uni_opened < max_uni_streams_server_limit:
+            if quic_conn._streams_uni_opened < quic_conn._peer_transport_parameters.initial_max_streams_uni:
                 # Generate the *next* client-initiated unidirectional stream ID
                 # The stream type for client-initiated unidirectional is 0x02.
                 # Stream IDs are like: 2, 6, 10, 14, ...
@@ -1676,7 +1676,7 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
                 # The next available stream_id for a client initiated unidirectional stream
                 stream_id_to_create = quic_conn.get_next_available_stream_id(is_unidirectional=True)
 
-                print(f"Attempting to open unidirectional stream ID: {stream_id_to_create} ({quic_conn._streams_uni_opened + 1}/{max_uni_streams_server_limit})")
+                print(f"Attempting to open unidirectional stream ID: {stream_id_to_create} ({quic_conn._streams_uni_opened + 1}/{quic_conn._peer_transport_parameters.initial_max_streams_uni})")
                 try:
                     # This method creates if not exists, and is for sending.
                     # For uni streams, usually you'd write to it.
@@ -1698,16 +1698,16 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
                     # This might happen if server rejects it for reasons other than count (e.g. ID exhaustion if many resets)
                     break
             else:
-                print(f"Reached server's unidirectional stream limit ({max_uni_streams_server_limit}). "
+                print(f"Reached server's unidirectional stream limit ({quic_conn._peer_transport_parameters.initial_max_streams_uni}). "
                       f"Not attempting to open more streams. Opened {opened_streams_count} streams.")
                 server.result |= Result.M # Mark as success for respecting the limit
                 return # Test successful
 
-        if opened_streams_count == max_uni_streams_server_limit:
-            print(f"Successfully opened and used all {max_uni_streams_server_limit} unidirectional streams.")
+        if opened_streams_count == quic_conn._peer_transport_parameters.initial_max_streams_uni:
+            print(f"Successfully opened and used all {quic_conn._peer_transport_parameters.initial_max_streams_uni} unidirectional streams.")
             server.result |= Result.M
-        elif opened_streams_count < max_uni_streams_server_limit :
-            print(f"Warning: Opened only {opened_streams_count} out of {max_uni_streams_server_limit} streams before loop ended or error.")
+        elif opened_streams_count < quic_conn._peer_transport_parameters.initial_max_streams_uni :
+            print(f"Warning: Opened only {opened_streams_count} out of {quic_conn._peer_transport_parameters.initial_max_streams_uni} streams before loop ended or error.")
             # Potentially still a pass if no error occurred and we just didn't hit the +5 in the loop range.
             # Or could be a fail if an unexpected error broke the loop.
             # For now, let's assume if no exception broke it, and we didn't exceed, it's a form of pass.
@@ -1717,8 +1717,8 @@ async def test_max_uni_streams_kdaquic(server: Server, configuration: QuicConfig
             server.result |= Result.M # Pass if we respected limit, even if not all opened due to other reasons
         else:
             # This case (opened_streams_count > max_uni_streams_server_limit) should not be reached
-            # due to the check `quic_conn._streams_uni_opened < max_uni_streams_server_limit`.
-            print(f"Error: Opened {opened_streams_count} streams, which is more than the limit {max_uni_streams_server_limit}.")
+            # due to the check `quic_conn._streams_uni_opened < quic_conn._peer_transport_parameters.initial_max_streams_uni`.
+            print(f"Error: Opened {opened_streams_count} streams, which is more than the limit {quic_conn._peer_transport_parameters.initial_max_streams_uni}.")
             # This would be a test failure, so don't set Result.M
 
 def print_result(server: Server) -> None:
