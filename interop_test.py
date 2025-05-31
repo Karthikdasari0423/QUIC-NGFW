@@ -1662,7 +1662,7 @@ async def test_send_after_peer_reset(server: Server, configuration: QuicConfigur
             # Let's log current stream state before simulating RESET_STREAM
             stream_before_reset = client._quic._streams.get(stream_id)
             if stream_before_reset:
-                client._quic._logger.info(f"Stream {stream_id} state before reset: send_buffer empty={stream_before_reset.sender.buffer_is_empty}, flow_control_blocked={(stream_before_reset.sender._offset >= stream_before_reset.sender._flow_control_limit)}, stream_ended={stream_before_reset.sender.stream_ended}")
+                client._quic._logger.info(f"Stream {stream_id} state before reset: send_buffer empty={stream_before_reset.sender.buffer_is_empty}, stream_ended={stream_before_reset.sender.stream_ended}")
 
             # Simulate client receiving RESET_STREAM for stream_id
             # This is a conceptual step. In a real test against a generic server,
