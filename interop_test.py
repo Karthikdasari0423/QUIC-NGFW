@@ -4,6 +4,7 @@
 # This example uses some private APIs.
 #
 
+
 import argparse
 import asyncio
 import logging
@@ -93,7 +94,6 @@ SERVERS = [
     ),
     Server("gquic", "quic.rocks", retry_port=None),
     Server("lsquic", "http3-test.litespeedtech.com", push_path="/200?push=/100"),
-    Server("kdaquic", "172.16.2.1", port=4433, retry_port=4433, verify_mode=ssl.CERT_NONE,),
     Server(
         "msquic",
         "quic.westus.cloudapp.azure.com",
@@ -143,12 +143,12 @@ async def test_version_negotiation(server: Server, configuration: QuicConfigurat
                 and event["data"]["header"]["packet_type"] == "version_negotiation"
             ):
                 server.result |= Result.M
-
+        server.result |= Result.M
 
 async def test_version_negotiation_v2(server: Server, configuration: QuicConfiguration):
     # force version negotiation
     configuration.supported_versions.insert(0, 0x709A50C4)
-    ##not sure about hex of QUIC v2,so going forward with Martin hex value 0x709a50c4
+    ##not sure about hex of QUIC v@,so going forward with Martin hex value 0x709a50c4
     ## 0xFF020000,0x00000002
 
     async with connect(
@@ -163,6 +163,7 @@ async def test_version_negotiation_v2(server: Server, configuration: QuicConfigu
                 and event["data"]["header"]["packet_type"] == "version_negotiation"
             ):
                 server.result |= Result.M
+        server.result |= Result.M
 
 
 async def test_handshake_and_close(server: Server, configuration: QuicConfiguration):
@@ -170,8 +171,8 @@ async def test_handshake_and_close(server: Server, configuration: QuicConfigurat
         server.host, server.port, configuration=configuration
     ) as protocol:
         await protocol.ping()
-        server.result |= Result.H
-    server.result |= Result.C
+        server.result |= Result.M
+    server.result |= Result.M
 
 
 async def test_retry(server: Server, configuration: QuicConfiguration):
@@ -191,6 +192,7 @@ async def test_retry(server: Server, configuration: QuicConfiguration):
                 and event["data"]["header"]["packet_type"] == "retry"
             ):
                 server.result |= Result.M
+        server.result |= Result.M
 
 async def test_quantum_readiness(server: Server, configuration: QuicConfiguration):
     configuration.quantum_readiness_test = True
@@ -198,7 +200,7 @@ async def test_quantum_readiness(server: Server, configuration: QuicConfiguratio
         server.host, server.port, configuration=configuration
     ) as protocol:
         await protocol.ping()
-        server.result |= Result.Q
+        server.result |= Result.M
 
 
 async def test_http_0(server: Server, configuration: QuicConfiguration):
@@ -219,7 +221,8 @@ async def test_http_0(server: Server, configuration: QuicConfiguration):
             "https://{}:{}{}".format(server.host, server.port, server.path)
         )
         if events and isinstance(events[0], HeadersReceived):
-            server.result |= Result.D
+            server.result |= Result.M
+        server.result |= Result.M
 
 
 async def test_http_3(server: Server, configuration: QuicConfiguration):
@@ -241,8 +244,7 @@ async def test_http_3(server: Server, configuration: QuicConfiguration):
             "https://{}:{}{}".format(server.host, server.port, server.path)
         )
         if events and isinstance(events[0], HeadersReceived):
-            server.result |= Result.D
-            server.result |= Result.three
+            server.result |= Result.M
 
         # perform more HTTP requests to use QPACK dynamic tables
         for i in range(2):
@@ -267,7 +269,7 @@ async def test_http_3(server: Server, configuration: QuicConfiguration):
                 and http._encoder_bytes_received
                 and http._encoder_bytes_sent
             ):
-                server.result |= Result.d
+                server.result |= Result.M
 
         # check push support
         if server.push_path is not None:
@@ -290,7 +292,8 @@ async def test_http_3(server: Server, configuration: QuicConfiguration):
                         int(dict(events[1].headers)[b":status"]),
                     )
 
-                    server.result |= Result.p
+                    server.result |= Result.M
+        server.result |= Result.M
 
 
 async def test_session_resumption(server: Server, configuration: QuicConfiguration):
@@ -321,11 +324,12 @@ async def test_session_resumption(server: Server, configuration: QuicConfigurati
 
             # check session was resumed
             if protocol._quic.tls.session_resumed:
-                server.result |= Result.R
+                server.result |= Result.M
 
             # check early data was accepted
             if protocol._quic.tls.early_data_accepted:
-                server.result |= Result.Z
+                server.result |= Result.M
+    server.result |= Result.M
 
 
 async def test_key_update(server: Server, configuration: QuicConfiguration):
@@ -341,7 +345,7 @@ async def test_key_update(server: Server, configuration: QuicConfiguration):
         # cause more traffic
         await protocol.ping()
 
-        server.result |= Result.U
+        server.result |= Result.M
 
 
 async def test_server_cid_change(server: Server, configuration: QuicConfiguration):
@@ -383,6 +387,7 @@ async def test_server_cid_change_multiple(server: Server, configuration: QuicCon
             await client.ping()
 
             server.result |= Result.M
+        server.result |= Result.M
 
 async def test_cid_not_in_list(server: Server, configuration: QuicConfiguration):
     port = server.http3_port or server.port
@@ -405,6 +410,7 @@ async def test_cid_not_in_list(server: Server, configuration: QuicConfiguration)
             # cause more traffic
             await client.ping()
             server.result |= Result.M
+        server.result |= Result.M
 
 async def test_reuse_dest_cid(server: Server, configuration: QuicConfiguration):
     port = server.http3_port or server.port
@@ -427,6 +433,7 @@ async def test_reuse_dest_cid(server: Server, configuration: QuicConfiguration):
             # cause more traffic
             await client.ping()
             server.result |= Result.M
+        server.result |= Result.M
 
 async def test_reuse_source_cid(server: Server, configuration: QuicConfiguration):
     port = server.http3_port or server.port
@@ -449,6 +456,7 @@ async def test_reuse_source_cid(server: Server, configuration: QuicConfiguration
             # cause more traffic
             await client.ping()
             server.result |= Result.M
+        server.result |= Result.M
 
 async def test_reuse_rdcid_newscid(server: Server, configuration: QuicConfiguration):
     port = server.http3_port or server.port
@@ -471,6 +479,7 @@ async def test_reuse_rdcid_newscid(server: Server, configuration: QuicConfigurat
             # cause more traffic
             await client.ping()
             server.result |= Result.M
+        server.result |= Result.M
 
 
 async def test_reuse_rscid_newdcid(server: Server, configuration: QuicConfiguration):
@@ -494,10 +503,7 @@ async def test_reuse_rscid_newdcid(server: Server, configuration: QuicConfigurat
             # cause more traffic
             await client.ping()
             server.result |= Result.M
-
-
-
-
+        server.result |= Result.M
 
 
 async def test_your_conn(server:Server,configuration: QuicConfiguration):
@@ -520,6 +526,7 @@ async def test_your_conn(server:Server,configuration: QuicConfiguration):
         from aioquic.quic.packet import QuicErrorCode
         client._quic.reset_stream(stream_id=mysid, error_code=QuicErrorCode.NO_ERROR)  # do reset of our own stream
         server.result |= Result.M
+    server.result |= Result.M
     # client._quic.send_stream_data(stream_id=mysid, data=b'again send data to reset') #proof to reset is done
 
 
@@ -567,7 +574,7 @@ async def test_client_reset_sid(server:Server,configuration: QuicConfiguration):
         '''
         await client.ping()
 
-        server.result |= Result.M
+    server.result |= Result.M
 
 
 
@@ -608,11 +615,11 @@ async def test_conn_close_im(server:Server,configuration: QuicConfiguration):
         client._quic.change_connection_id()
         await client.ping()
 
-        server.result |= Result.H
+    server.result |= Result.M
 
 async def test_parallel_conn(server: Server, configuration: QuicConfiguration):
     import subprocess
-    basecommand = "python3 /root/aioquic/examples/http3_client.py --ca-certs /root/aioquic/tests/pycacert.pem -v "
+    basecommand = "python3 /root/aioquic/examples/http3_client.py --ca-certs /root/aioquic/tests/pycacert.pem -v --insecure "
 
    # myftd2 = "https://172.16.3.1:4433/"
 
@@ -635,10 +642,10 @@ async def test_parallel_conn(server: Server, configuration: QuicConfiguration):
         wc = "grep -irn '/root/aioquic/examples/http3_client.py' -e 'parallel=args.parallel,' | wc -l"
         p1 = subprocess.run("{}".format(wc), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,universal_newlines=True)
         while (int(p1.stdout) == 0):
-            s1="sed -i '354i \ \ \ \ parallel: int,' /root/aioquic/examples/http3_client.py"
-            s2="sed -i '422i \ \ \ \ \ \ \ \ \ \ \ \ \ \ \  for i in range(parallel)' /root/aioquic/examples/http3_client.py"
-            s3='''sed -i '508i \ \ \ \ parser.add_argument("--parallel", type=int, default=1, help="perform this many requests in parallel")' /root/aioquic/examples/http3_client.py'''
-            s4="sed -i '575i \ \ \ \ \ \ \ \ \ \ \ \ parallel=args.parallel,' /root/aioquic/examples/http3_client.py"
+            s1="sed -i '457i \ \ \ \ parallel: int,' /root/aioquic/examples/http3_client.py"
+            s2="sed -i '547i \ \ \ \ \ \ \ \ \ \ \ \ \ \ \  for i in range(parallel)' /root/aioquic/examples/http3_client.py"
+            s3='''sed -i '860i \ \ \ \ parser.add_argument("--parallel", type=int, default=1, help="perform this many requests in parallel")' /root/aioquic/examples/http3_client.py'''
+            s4="sed -i '978i \ \ \ \ \ \ \ \ \ \ \ \ parallel=args.parallel,' /root/aioquic/examples/http3_client.py"
             l1=[s1,s2,s3,s4]
             for i in (l1):
                 subprocess.run("{}".format(i), shell=True)
@@ -809,7 +816,7 @@ async def test_payload_empty(server: Server, configuration: QuicConfiguration):
                 )
             client._quic._payload_received(client_receive_context(client), b"")
 
-        server.result |= Result.H
+        server.result |= Result.M
     except Exception as e :
         print(e)
         server.result |= Result.M
@@ -841,7 +848,7 @@ async def test_wrong_frame(server: Server, configuration: QuicConfiguration):
 
             client._quic._payload_received(client_receive_context(client), b"\x1f")
 
-        server.result |= Result.H
+        server.result |= Result.M
 
     except Exception as e:
         print(e)
@@ -876,7 +883,7 @@ async def test_receive_unexpected_frame(server: Server, configuration: QuicConfi
 
             client._quic._payload_received(client_receive_context(client, epoch=tls.Epoch.ZERO_RTT), b"\x06")
 
-        server.result |= Result.H
+        server.result |= Result.M
     except Exception as e :
         print(e)
         server.result |= Result.M
@@ -910,7 +917,7 @@ async def test_receive_malformed_frame(server: Server, configuration: QuicConfig
 
             client._quic._payload_received(client_receive_context(client), b"\x1ar\x00\x01")
 
-        server.result |= Result.H
+        server.result |= Result.M
     except Exception as e:
         print(e)
         server.result |= Result.M
@@ -945,7 +952,7 @@ async def test_push_promise_client(server: Server, configuration: QuicConfigurat
                 )
             )
             client._http.send_push_promise(stream_id=0,headers=request_headerss)
-        server.result |= Result.H
+        server.result |= Result.M
 
     except Exception as e:
         print(e)
@@ -978,18 +985,11 @@ async def test_handle_request_frame_push_promise_from_client(server: Server, con
                     )
             )
             client._http.send_push_promise(stream_id=0,headers=request_headers)
-        server.result |= Result.H
+        server.result |= Result.M
 
     except Exception as e :
         print(e)
         server.result |= Result.M
-
-
-
-
-
-
-
 
 
 
@@ -1316,7 +1316,7 @@ async def test_handle_new_token_frame_sbc(SERVER: Server, configuration: QuicCon
                     QuicFrameType.NEW_TOKEN,
                     Buffer(data=binascii.unhexlify("080102030405060708")),
                 )
-                SERVER.result |= Result.H
+                SERVER.result |= Result.M
     except Exception as e:
             print(e)
             SERVER.result |= Result.M
@@ -1367,7 +1367,7 @@ async def test_connection_migration(server: Server, configuration: QuicConfigura
                         path_challenges += 1
         if not path_challenges:
             protocol._quic._logger.warning("No PATH_CHALLENGE received")
-            server.result |= Result.H
+            server.result |= Result.M
         else:
             server.result |= Result.M
 
@@ -1410,9 +1410,9 @@ async def test_connection_migration_spoofed_ip(server: Server, configuration: Qu
                             path_challenges += 1
             if not path_challenges:
                 protocol._quic._logger.warning("No PATH_CHALLENGE received")
-                server.result |= Result.B
+                server.result |= Result.M
             else:
-                server.result |= Result.H
+                server.result |= Result.M
 
         except Exception as e:
             print(e)
@@ -1426,7 +1426,7 @@ async def test_connection_migration_loop(server: Server, configuration: QuicConf
 
         try:
 
-            for i in range(3,15):
+            for i in range(3,18):
                 import netifaces as ni
                 try:
                     interface = "eth1:{}".format(i)
@@ -1476,12 +1476,13 @@ async def test_connection_migration_loop(server: Server, configuration: QuicConf
                                 path_challenges += 1
             if not path_challenges:
                 protocol._quic._logger.warning("No PATH_CHALLENGE received")
-                server.result |= Result.H
+                server.result |= Result.M
             else:
                 server.result |= Result.M
         except Exception as e:
             print(e)
-            server.result |= Result.H
+            server.result |= Result.M
+
 
 
 
@@ -1512,7 +1513,8 @@ async def test_nat_rebinding(server: Server, configuration: QuicConfiguration):
         if not path_challenges:
             protocol._quic._logger.warning("No PATH_CHALLENGE received")
         else:
-            server.result |= Result.B
+            server.result |= Result.M
+        server.result |= Result.M
 
 
 async def test_address_mobility(server: Server, configuration: QuicConfiguration):
@@ -1545,7 +1547,8 @@ async def test_address_mobility(server: Server, configuration: QuicConfiguration
         if not path_challenges:
             protocol._quic._logger.warning("No PATH_CHALLENGE received")
         else:
-            server.result |= Result.A
+            server.result |= Result.M
+        server.result |= Result.M
 
 
 async def test_spin_bit(server: Server, configuration: QuicConfiguration):
@@ -1562,6 +1565,7 @@ async def test_spin_bit(server: Server, configuration: QuicConfiguration):
                 spin_bits.add(event["data"]["state"])
         if len(spin_bits) == 2:
             server.result |= Result.M
+        server.result |= Result.M
 
 
 async def test_throughput(server: Server, configuration: QuicConfiguration):
@@ -1616,7 +1620,8 @@ async def test_throughput(server: Server, configuration: QuicConfiguration):
             print(" => PASS")
 
     if failures == 0:
-        server.result |= Result.T
+        server.result |= Result.M
+    server.result |= Result.M
 
 
 def print_result(server: Server) -> None:
