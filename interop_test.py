@@ -642,10 +642,10 @@ async def test_parallel_conn(server: Server, configuration: QuicConfiguration):
         wc = "grep -irn '/root/aioquic/examples/http3_client.py' -e 'parallel=args.parallel,' | wc -l"
         p1 = subprocess.run("{}".format(wc), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,universal_newlines=True)
         while (int(p1.stdout) == 0):
-            s1="sed -i '457i \ \ \ \ parallel: int,' /root/aioquic/examples/http3_client.py"
-            s2="sed -i '547i \ \ \ \ \ \ \ \ \ \ \ \ \ \ \  for i in range(parallel)' /root/aioquic/examples/http3_client.py"
-            s3='''sed -i '860i \ \ \ \ parser.add_argument("--parallel", type=int, default=1, help="perform this many requests in parallel")' /root/aioquic/examples/http3_client.py'''
-            s4="sed -i '978i \ \ \ \ \ \ \ \ \ \ \ \ parallel=args.parallel,' /root/aioquic/examples/http3_client.py"
+            s1="sed -i '458i \ \ \ \ parallel: int,' /root/aioquic/examples/http3_client.py"
+            s2="sed -i '548i \ \ \ \ \ \ \ \ \ \ \ \ \ \ \  for i in range(parallel)' /root/aioquic/examples/http3_client.py"
+            s3='''sed -i '861i \ \ \ \ parser.add_argument("--parallel", type=int, default=1, help="perform this many requests in parallel")' /root/aioquic/examples/http3_client.py'''
+            s4="sed -i '979i \ \ \ \ \ \ \ \ \ \ \ \ parallel=args.parallel,' /root/aioquic/examples/http3_client.py"
             l1=[s1,s2,s3,s4]
             for i in (l1):
                 subprocess.run("{}".format(i), shell=True)
